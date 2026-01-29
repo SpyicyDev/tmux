@@ -70,7 +70,8 @@ CODEXBAR_USAGE_DEBUG="$(parse_int_with_default "$(opt_or_env_or_default '@codexb
 USAGE_REFRESH_LOG_FILE="${CACHE_DIR}/usage-refresh.log"
 
 STALE_AFTER_SECONDS="$(parse_int_with_default "$(opt_or_env_or_default '@codexbar_stale_after_seconds' 'CODEXBAR_USAGE_STALE_AFTER_SECONDS' '300')" 300)"
-if (( STALE_AFTER_SECONDS < 30 )); then
+
+if (( CODEXBAR_USAGE_DEBUG == 0 && STALE_AFTER_SECONDS < 30 )); then
   STALE_AFTER_SECONDS=30
 fi
 
@@ -104,12 +105,12 @@ debug_flash_codex_icons() {
   local flash_color
   flash_color="$(tmux_opt_or_empty '@codexbar_debug_flash_color')"
   if [[ -z "${flash_color:-}" ]]; then
-    flash_color='colour214'
+    flash_color='default'
   fi
 
   local prev_session prev_weekly nonce
-  prev_session="$(tmux show-option -gqv @catppuccin_codex_session_color 2>/dev/null || true)"
-  prev_weekly="$(tmux show-option -gqv @catppuccin_codex_weekly_color 2>/dev/null || true)"
+  prev_session="$(tmux show-option -gqv @codex_session_color 2>/dev/null || true)"
+  prev_weekly="$(tmux show-option -gqv @codex_weekly_color 2>/dev/null || true)"
 
   nonce="$(date +%s%N 2>/dev/null || date +%s)"
 
@@ -117,18 +118,89 @@ debug_flash_codex_icons() {
   tmux set-option -gq @codexbar_debug_flash_prev_session_color "$prev_session" >/dev/null 2>&1 || true
   tmux set-option -gq @codexbar_debug_flash_prev_weekly_color "$prev_weekly" >/dev/null 2>&1 || true
 
-  tmux set-option -gq @catppuccin_codex_session_color "$flash_color" >/dev/null 2>&1 || true
-  tmux set-option -gq @catppuccin_codex_weekly_color "$flash_color" >/dev/null 2>&1 || true
+  tmux set-option -gq @codex_session_color "$flash_color" >/dev/null 2>&1 || true
+  tmux set-option -gq @codex_weekly_color "$flash_color" >/dev/null 2>&1 || true
   tmux refresh-client -S >/dev/null 2>&1 || true
   log_debug "flash: on color=${flash_color}"
 
-  tmux run-shell -b "sleep 0.2; n=\$(tmux show-option -gqv @codexbar_debug_flash_nonce 2>/dev/null); [ \"\$n\" = \"$nonce\" ] || exit 0; s=\$(tmux show-option -gqv @codexbar_debug_flash_prev_session_color 2>/dev/null); w=\$(tmux show-option -gqv @codexbar_debug_flash_prev_weekly_color 2>/dev/null); if [ -n \"\$s\" ]; then tmux set-option -gq @catppuccin_codex_session_color \"\$s\"; else tmux set-option -gu @catppuccin_codex_session_color; fi; if [ -n \"\$w\" ]; then tmux set-option -gq @catppuccin_codex_weekly_color \"\$w\"; else tmux set-option -gu @catppuccin_codex_weekly_color; fi; tmux refresh-client -S;" >/dev/null 2>&1 || true
+  tmux run-shell -b "sleep 0.5; n=\$(tmux show-option -gqv @codexbar_debug_flash_nonce 2>/dev/null); [ \"\$n\" = \"$nonce\" ] || exit 0; fc='$flash_color'; cs=\$(tmux show-option -gqv @codex_session_color 2>/dev/null || true); cw=\$(tmux show-option -gqv @codex_weekly_color 2>/dev/null || true); s=\$(tmux show-option -gqv @codexbar_debug_flash_prev_session_color 2>/dev/null); w=\$(tmux show-option -gqv @codexbar_debug_flash_prev_weekly_color 2>/dev/null); if [ \"\$cs\" = \"\$fc\" ]; then if [ -n \"\$s\" ]; then tmux set-option -gq @codex_session_color \"\$s\"; else tmux set-option -gu @codex_session_color; fi; fi; if [ \"\$cw\" = \"\$fc\" ]; then if [ -n \"\$w\" ]; then tmux set-option -gq @codex_weekly_color \"\$w\"; else tmux set-option -gu @codex_weekly_color; fi; fi; tmux refresh-client -S;" >/dev/null 2>&1 || true
+}
+
+script_abs_path() {
+  local script="$0"
+  if [[ "$script" != /* ]]; then
+    script="$(cd -- "$(dirname -- "$script")" && pwd)/$(basename -- "$script")"
+  fi
+  printf '%s' "$script"
+}
+
+debug_flash_loop_nonce_opt='@codexbar__debug_flash_loop_nonce'
+
+debug_flash_loop_enabled() {
+  (( CODEXBAR_USAGE_DEBUG != 0 )) || return 1
+  command -v tmux >/dev/null 2>&1 || return 1
+  (( STALE_AFTER_SECONDS > 0 )) || return 1
+  return 0
+}
+
+schedule_debug_flash_tick() {
+  local nonce="${1:-}" period="${2:-0}"
+
+  [[ -n "${nonce:-}" ]] || return 0
+  [[ "$period" =~ ^[0-9]+$ ]] || return 0
+  (( period > 0 )) || return 0
+
+  local script
+  script="$(script_abs_path)"
+
+  tmux run-shell -b "sleep $period; n=\$(tmux show-option -gqv $debug_flash_loop_nonce_opt 2>/dev/null || true); [ \"\$n\" = \"$nonce\" ] || exit 0; \"$script\" --debug-flash-tick \"$nonce\" >/dev/null 2>&1" >/dev/null 2>&1 || true
+}
+
+start_debug_flash_loop_if_needed() {
+  command -v tmux >/dev/null 2>&1 || return 0
+
+  if ! debug_flash_loop_enabled; then
+    tmux set-option -gu $debug_flash_loop_nonce_opt >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  local existing
+  existing="$(tmux show-option -gqv $debug_flash_loop_nonce_opt 2>/dev/null || true)"
+  [[ -n "${existing:-}" ]] && return 0
+
+  local nonce
+  nonce="$(date +%s%N 2>/dev/null || date +%s)"
+
+  tmux set-option -gq $debug_flash_loop_nonce_opt "$nonce" >/dev/null 2>&1 || true
+  log_debug "flash-loop: start nonce=${nonce} period=${STALE_AFTER_SECONDS}"
+
+  schedule_debug_flash_tick "$nonce" "$STALE_AFTER_SECONDS"
+}
+
+debug_flash_tick() {
+  local expected_nonce="${1:-}"
+
+  command -v tmux >/dev/null 2>&1 || return 0
+  [[ -n "${expected_nonce:-}" ]] || return 0
+
+  local current
+  current="$(tmux show-option -gqv $debug_flash_loop_nonce_opt 2>/dev/null || true)"
+  [[ -n "${current:-}" && "$current" == "$expected_nonce" ]] || return 0
+
+  if ! debug_flash_loop_enabled; then
+    tmux set-option -gu $debug_flash_loop_nonce_opt >/dev/null 2>&1 || true
+    log_debug "flash-loop: stop"
+    return 0
+  fi
+
+  debug_flash_codex_icons
+  schedule_debug_flash_tick "$expected_nonce" "$STALE_AFTER_SECONDS"
 }
 
 LOCK_STALE_SECONDS=120
 
 usage() {
-  printf '%s\n' "Usage: $0 {session|weekly|--refresh}" >&2
+  printf '%s\n' "Usage: $0 {session|weekly|--refresh|--debug-flash-tick <nonce>}" >&2
 }
 
 now_epoch() {
@@ -152,7 +224,7 @@ read_refresh_backoff() {
     next_allowed=0
   fi
 
-  printf '%s %s' "$fail_count" "$next_allowed"
+  printf '%s %s\n' "$fail_count" "$next_allowed"
 }
 
 refresh_backoff_delay_seconds() {
@@ -512,16 +584,17 @@ clear_stale_lock_if_needed() {
   [[ -d "$LOCKDIR" ]] || return 0
 
   local started_at now age
-  started_at=0
   if [[ -f "$LOCKDIR/started_at" ]]; then
-    started_at="$(cat "$LOCKDIR/started_at" 2>/dev/null || printf '0')"
+    started_at="$(cat "$LOCKDIR/started_at" 2>/dev/null || true)"
+  else
+    return 0
   fi
 
   now="$(now_epoch)"
   if [[ "$started_at" =~ ^[0-9]+$ ]]; then
     age=$(( now - started_at ))
   else
-    age=$LOCK_STALE_SECONDS
+    return 0
   fi
 
   if (( age > LOCK_STALE_SECONDS )); then
@@ -653,23 +726,31 @@ refresh_cache() {
 
   ensure_codex_cli_in_path
 
-  local raw_json fetch_out
+  local raw_json fetch_out fetch_err stderr_file
+
+  stderr_file="$(mktemp "${CACHE_DIR}/codexbar.stderr.XXXXXX")"
+
   set +e
-  fetch_out="$(codexbar --provider codex --format json --json-only --web-timeout "$WEB_TIMEOUT_SECONDS" 2>&1)"
+  fetch_out="$(codexbar --provider codex --format json --json-only --web-timeout "$WEB_TIMEOUT_SECONDS" 2>"$stderr_file")"
   local fetch_status=$?
   set -e
+  fetch_err="$(cat "$stderr_file" 2>/dev/null || true)"
 
   if (( fetch_status != 0 )); then
-    if [[ "$fetch_out" == *"Unknown option --json-only"* ]]; then
+    if [[ "$fetch_out" == *"Unknown option --json-only"* || "$fetch_err" == *"Unknown option --json-only"* ]]; then
+      : >"$stderr_file" 2>/dev/null || true
       set +e
-      fetch_out="$(codexbar --provider codex --format json --web-timeout "$WEB_TIMEOUT_SECONDS" 2>&1)"
+      fetch_out="$(codexbar --provider codex --format json --web-timeout "$WEB_TIMEOUT_SECONDS" 2>"$stderr_file")"
       fetch_status=$?
       set -e
+      fetch_err="$(cat "$stderr_file" 2>/dev/null || true)"
     fi
   fi
 
+  rm -f "$stderr_file" 2>/dev/null || true
+
   if (( fetch_status != 0 )); then
-    log_debug_trunc "refresh: codexbar nonzero status=${fetch_status} out=${fetch_out}" 300
+    log_debug_trunc "refresh: codexbar nonzero status=${fetch_status} err=${fetch_err} out=${fetch_out}" 300
     refresh_fail
     return 1
   fi
@@ -677,8 +758,8 @@ refresh_cache() {
   raw_json="$fetch_out"
 
   local normalized session_raw weekly_raw
-  if ! normalized="$(printf '%s' "$raw_json" | jq -er 'if type=="array" then .[0] else . end' 2>/dev/null)"; then
-    log_debug "refresh: jq parse failure (normalize)"
+  if ! normalized="$(printf '%s' "$raw_json" | jq -ser '[.[] | (if type=="array" then .[0] else . end)] | map(select(.usage?)) | .[0]' 2>/dev/null)"; then
+    log_debug_trunc "refresh: jq parse failure (normalize) out=${raw_json}" 300
     refresh_fail
     return 1
   fi
@@ -763,7 +844,6 @@ EOF
   fi
 
   log_debug "refresh: success updated_at=${updated_at} session=${session_used}% weekly=${weekly_used}%"
-  debug_flash_codex_icons
 
   reset_refresh_backoff
 }
@@ -776,6 +856,10 @@ main() {
       refresh_cache || true
       exit 0
       ;;
+    --debug-flash-tick)
+      debug_flash_tick "${2:-}"
+      exit 0
+      ;;
     session|weekly)
       :
       ;;
@@ -785,6 +869,8 @@ main() {
       ;;
   esac
 
+  start_debug_flash_loop_if_needed
+
   print_value "$mode"
 
   local ts now age
@@ -792,15 +878,19 @@ main() {
   now="$(now_epoch)"
   age=$(( now - ts ))
 
-  if [[ ! -f "$CACHE_FILE" ]] || (( age > STALE_AFTER_SECONDS )); then
+  if [[ ! -f "$CACHE_FILE" ]] || (( age >= STALE_AFTER_SECONDS )); then
     mkdir -p "$CACHE_DIR"
+
+    log_debug "stale: now=${now} ts=${ts} age=${age} threshold=${STALE_AFTER_SECONDS}"
 
     local fail_count next_allowed
     read -r fail_count next_allowed < <(read_refresh_backoff)
     if (( now < next_allowed )); then
+      log_debug "stale: backoff fail_count=${fail_count} next_allowed=${next_allowed}"
       return 0
     fi
 
+    log_debug "stale: spawn refresh"
     spawn_background_refresh_locked || true
   fi
 }
