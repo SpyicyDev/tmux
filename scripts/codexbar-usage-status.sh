@@ -135,6 +135,7 @@ script_abs_path() {
 }
 
 debug_flash_loop_nonce_opt='@codexbar__debug_flash_loop_nonce'
+debug_update_counter_opt='@codexbar__debug_update_counter'
 
 debug_flash_loop_enabled() {
   (( CODEXBAR_USAGE_DEBUG != 0 )) || return 1
@@ -161,6 +162,13 @@ start_debug_flash_loop_if_needed() {
 
   if ! debug_flash_loop_enabled; then
     tmux set-option -gu $debug_flash_loop_nonce_opt >/dev/null 2>&1 || true
+
+    local prev_counter
+    prev_counter="$(tmux show-option -gqv "$debug_update_counter_opt" 2>/dev/null || true)"
+    if [[ -n "${prev_counter:-}" && "${prev_counter:-}" != "0" ]]; then
+      tmux set-option -gq "$debug_update_counter_opt" 0 >/dev/null 2>&1 || true
+    fi
+
     return 0
   fi
 
@@ -537,6 +545,16 @@ print_value() {
 
   maybe_set_tmux_color_from_cache "$mode"
 
+  local debug_suffix=''
+  if (( CODEXBAR_USAGE_DEBUG != 0 )) && command -v tmux >/dev/null 2>&1; then
+    local c
+    c="$(tmux show-option -gqv "$debug_update_counter_opt" 2>/dev/null || true)"
+    if ! [[ "${c:-}" =~ ^[0-9]+$ ]]; then
+      c=0
+    fi
+    debug_suffix=" d${c}"
+  fi
+
   if [[ "$view" == "reset" ]]; then
     now="$(now_epoch)"
     case "$mode" in
@@ -552,7 +570,7 @@ print_value() {
         ;;
     esac
 
-    printf '%s\n' "$(format_time_until_reset "$resets_at" "$now")"
+    printf '%s\n' "$(format_time_until_reset "$resets_at" "$now")${debug_suffix}"
     return 0
   fi
 
@@ -560,17 +578,17 @@ print_value() {
     session)
       v="$(read_cached_field 'session_text' 2>/dev/null || true)"
       if [[ -z "${v:-}" ]]; then
-        printf '%s\n' '--%'
+        printf '%s\n' "--%${debug_suffix}"
       else
-        printf '%s\n' "$(strip_legacy_label_prefix "$v")"
+        printf '%s\n' "$(strip_legacy_label_prefix "$v")${debug_suffix}"
       fi
       ;;
     weekly)
       v="$(read_cached_field 'weekly_text' 2>/dev/null || true)"
       if [[ -z "${v:-}" ]]; then
-        printf '%s\n' '--%'
+        printf '%s\n' "--%${debug_suffix}"
       else
-        printf '%s\n' "$(strip_legacy_label_prefix "$v")"
+        printf '%s\n' "$(strip_legacy_label_prefix "$v")${debug_suffix}"
       fi
       ;;
     *)
@@ -580,6 +598,22 @@ print_value() {
   esac
 }
 
+lockdir_mtime_epoch() {
+  local path="${1:-}"
+  [[ -n "${path:-}" ]] || return 1
+
+  local mtime
+  mtime="$(stat -f %m "$path" 2>/dev/null || true)"
+  if [[ "${mtime:-}" =~ ^[0-9]+$ ]]; then
+    printf '%s' "$mtime"
+    return 0
+  fi
+
+  mtime="$(stat -c %Y "$path" 2>/dev/null || true)"
+  [[ "${mtime:-}" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$mtime"
+}
+
 clear_stale_lock_if_needed() {
   [[ -d "$LOCKDIR" ]] || return 0
 
@@ -587,6 +621,15 @@ clear_stale_lock_if_needed() {
   if [[ -f "$LOCKDIR/started_at" ]]; then
     started_at="$(cat "$LOCKDIR/started_at" 2>/dev/null || true)"
   else
+    now="$(now_epoch)"
+    local mtime
+    mtime="$(lockdir_mtime_epoch "$LOCKDIR" 2>/dev/null || true)"
+    if [[ "${mtime:-}" =~ ^[0-9]+$ ]]; then
+      age=$(( now - mtime ))
+      if (( age > 2 )); then
+        rm -rf "$LOCKDIR" 2>/dev/null || true
+      fi
+    fi
     return 0
   fi
 
@@ -594,6 +637,7 @@ clear_stale_lock_if_needed() {
   if [[ "$started_at" =~ ^[0-9]+$ ]]; then
     age=$(( now - started_at ))
   else
+    rm -rf "$LOCKDIR" 2>/dev/null || true
     return 0
   fi
 
@@ -606,15 +650,15 @@ try_acquire_lock() {
   clear_stale_lock_if_needed
 
   if mkdir "$LOCKDIR" 2>/dev/null; then
-    printf '%s\n' "$(now_epoch)" >"$LOCKDIR/started_at" 2>/dev/null || true
-    printf '%s\n' "$$" >"$LOCKDIR/pid" 2>/dev/null || true
+    printf '%s\n' "$(now_epoch)" >"$LOCKDIR/started_at" 2>/dev/null || { rm -rf "$LOCKDIR" 2>/dev/null || true; return 1; }
+    printf '%s\n' "$$" >"$LOCKDIR/pid" 2>/dev/null || { rm -rf "$LOCKDIR" 2>/dev/null || true; return 1; }
     return 0
   fi
 
   clear_stale_lock_if_needed
   mkdir "$LOCKDIR" 2>/dev/null || return 1
-  printf '%s\n' "$(now_epoch)" >"$LOCKDIR/started_at" 2>/dev/null || true
-  printf '%s\n' "$$" >"$LOCKDIR/pid" 2>/dev/null || true
+  printf '%s\n' "$(now_epoch)" >"$LOCKDIR/started_at" 2>/dev/null || { rm -rf "$LOCKDIR" 2>/dev/null || true; return 1; }
+  printf '%s\n' "$$" >"$LOCKDIR/pid" 2>/dev/null || { rm -rf "$LOCKDIR" 2>/dev/null || true; return 1; }
   return 0
 }
 
@@ -841,6 +885,23 @@ EOF
   if command -v tmux >/dev/null 2>&1; then
     tmux set-option -gq @codex_session_color "$session_color" >/dev/null 2>&1 || true
     tmux set-option -gq @codex_weekly_color "$weekly_color" >/dev/null 2>&1 || true
+
+    local debug_opt
+    debug_opt="$(tmux show-option -gqv @codexbar_debug 2>/dev/null || true)"
+
+    if [[ "${debug_opt:-}" =~ ^[0-9]+$ ]] && (( debug_opt != 0 )); then
+      local n
+      n="$(tmux show-option -gqv "$debug_update_counter_opt" 2>/dev/null || true)"
+      if ! [[ "${n:-}" =~ ^[0-9]+$ ]]; then
+        n=0
+      fi
+      n=$(( n + 1 ))
+      tmux set-option -gq "$debug_update_counter_opt" "$n" >/dev/null 2>&1 || true
+    else
+      tmux set-option -gq "$debug_update_counter_opt" 0 >/dev/null 2>&1 || true
+    fi
+
+    tmux refresh-client -S >/dev/null 2>&1 || true
   fi
 
   log_debug "refresh: success updated_at=${updated_at} session=${session_used}% weekly=${weekly_used}%"
