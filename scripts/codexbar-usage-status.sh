@@ -97,6 +97,34 @@ log_debug_trunc() {
   log_debug "$msg"
 }
 
+debug_flash_codex_icons() {
+  (( CODEXBAR_USAGE_DEBUG != 0 )) || return 0
+  command -v tmux >/dev/null 2>&1 || return 0
+
+  local flash_color
+  flash_color="$(tmux_opt_or_empty '@codexbar_debug_flash_color')"
+  if [[ -z "${flash_color:-}" ]]; then
+    flash_color='colour214'
+  fi
+
+  local prev_session prev_weekly nonce
+  prev_session="$(tmux show-option -gqv @catppuccin_codex_session_color 2>/dev/null || true)"
+  prev_weekly="$(tmux show-option -gqv @catppuccin_codex_weekly_color 2>/dev/null || true)"
+
+  nonce="$(date +%s%N 2>/dev/null || date +%s)"
+
+  tmux set-option -gq @codexbar_debug_flash_nonce "$nonce" >/dev/null 2>&1 || true
+  tmux set-option -gq @codexbar_debug_flash_prev_session_color "$prev_session" >/dev/null 2>&1 || true
+  tmux set-option -gq @codexbar_debug_flash_prev_weekly_color "$prev_weekly" >/dev/null 2>&1 || true
+
+  tmux set-option -gq @catppuccin_codex_session_color "$flash_color" >/dev/null 2>&1 || true
+  tmux set-option -gq @catppuccin_codex_weekly_color "$flash_color" >/dev/null 2>&1 || true
+  tmux refresh-client -S >/dev/null 2>&1 || true
+  log_debug "flash: on color=${flash_color}"
+
+  tmux run-shell -b "sleep 0.2; n=\$(tmux show-option -gqv @codexbar_debug_flash_nonce 2>/dev/null); [ \"\$n\" = \"$nonce\" ] || exit 0; s=\$(tmux show-option -gqv @codexbar_debug_flash_prev_session_color 2>/dev/null); w=\$(tmux show-option -gqv @codexbar_debug_flash_prev_weekly_color 2>/dev/null); if [ -n \"\$s\" ]; then tmux set-option -gq @catppuccin_codex_session_color \"\$s\"; else tmux set-option -gu @catppuccin_codex_session_color; fi; if [ -n \"\$w\" ]; then tmux set-option -gq @catppuccin_codex_weekly_color \"\$w\"; else tmux set-option -gu @catppuccin_codex_weekly_color; fi; tmux refresh-client -S;" >/dev/null 2>&1 || true
+}
+
 LOCK_STALE_SECONDS=120
 
 usage() {
@@ -735,6 +763,7 @@ EOF
   fi
 
   log_debug "refresh: success updated_at=${updated_at} session=${session_used}% weekly=${weekly_used}%"
+  debug_flash_codex_icons
 
   reset_refresh_backoff
 }
