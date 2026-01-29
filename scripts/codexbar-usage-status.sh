@@ -1,0 +1,536 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+
+CACHE_DIR="${HOME}/.cache/codexbar-tmux"
+CACHE_FILE="${CACHE_DIR}/usage.json"
+LOCKDIR="${CACHE_FILE}.lock"
+
+STALE_AFTER_SECONDS=30
+LOCK_STALE_SECONDS=120
+
+usage() {
+  printf '%s\n' "Usage: $0 {session|weekly|--refresh}" >&2
+}
+
+now_epoch() {
+  date +%s
+}
+
+iso_utc_to_epoch() {
+  local iso="${1:-}"
+  [[ -n "$iso" ]] || return 1
+
+  local epoch
+  epoch="$(date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$iso" +%s 2>/dev/null || true)"
+  if [[ -z "${epoch:-}" ]]; then
+    if date -u -d "$iso" +%s >/dev/null 2>&1; then
+      epoch="$(date -u -d "$iso" +%s 2>/dev/null || true)"
+    fi
+  fi
+
+  [[ "$epoch" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$epoch"
+}
+
+clamp_0_100_int() {
+  local raw="$1" int
+
+  if [[ "$raw" == *.* ]]; then
+    int="${raw%%.*}"
+  else
+    int="$raw"
+  fi
+
+  if ! [[ "$int" =~ ^-?[0-9]+$ ]]; then
+    return 1
+  fi
+
+  if (( int < 0 )); then
+    int=0
+  elif (( int > 100 )); then
+    int=100
+  fi
+
+  printf '%s' "$int"
+}
+
+color_for_used_percent() {
+  local used="$1"
+  if (( used <= 49 )); then
+    printf '%s' 'green'
+  elif (( used <= 79 )); then
+    printf '%s' 'yellow'
+  else
+    printf '%s' 'red'
+  fi
+}
+
+weekly_pace_suffix() {
+  local actual_used_percent="$1" window_minutes="$2" resets_at="$3" now="$4"
+
+  [[ "$actual_used_percent" =~ ^[0-9]+$ ]] || return 0
+  [[ "$window_minutes" =~ ^[0-9]+$ ]] || return 0
+  [[ "$resets_at" =~ ^[0-9]+$ ]] || return 0
+  [[ "$now" =~ ^[0-9]+$ ]] || return 0
+
+  local duration time_until_reset elapsed
+  duration=$(( window_minutes * 60 ))
+  (( duration > 0 )) || return 0
+
+  time_until_reset=$(( resets_at - now ))
+
+  (( time_until_reset > 0 )) || return 0
+
+  if (( time_until_reset > duration )); then
+    return 0
+  fi
+
+  elapsed=$(( duration - time_until_reset ))
+  if (( elapsed < 0 )); then
+    elapsed=0
+  elif (( elapsed > duration )); then
+    elapsed=$duration
+  fi
+
+  if (( elapsed == 0 && actual_used_percent > 0 )); then
+    return 0
+  fi
+
+  local expected_used delta_sign delta_abs
+  expected_used="$(awk -v e="$elapsed" -v d="$duration" 'BEGIN { if (d <= 0) { print "0"; exit } printf "%.6f", (e / d) * 100 }')"
+
+  if awk -v x="$expected_used" 'BEGIN { exit (x >= 3.0) ? 0 : 1 }'; then
+    :
+  else
+    return 0
+  fi
+
+  read -r delta_sign delta_abs < <(
+    awk -v a="$actual_used_percent" -v e="$expected_used" 'BEGIN {
+      d = a - e
+      if (d < 0) { sign = "-"; d = -d } else { sign = "+" }
+      printf "%s %d", sign, int(d + 0.5)
+    }'
+  )
+
+  printf ' (%s%s%%)' "$delta_sign" "$delta_abs"
+}
+
+read_cached_field() {
+  local field="$1"
+
+  [[ -f "$CACHE_FILE" ]] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+
+  jq -er ".$field" "$CACHE_FILE" 2>/dev/null
+}
+
+maybe_set_tmux_color_from_cache() {
+  local mode="$1" field opt color
+
+  [[ -f "$CACHE_FILE" ]] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  command -v tmux >/dev/null 2>&1 || return 0
+
+  case "$mode" in
+    session)
+      field='session_color'
+      opt='@codex_session_color'
+      ;;
+    weekly)
+      field='weekly_color'
+      opt='@codex_weekly_color'
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+
+  color="$(jq -er ".$field" "$CACHE_FILE" 2>/dev/null || true)"
+  [[ -n "${color:-}" ]] || return 0
+
+  tmux set-option -gq "$opt" "$color" >/dev/null 2>&1 || true
+}
+
+cache_updated_at() {
+  local ts
+  ts="$(read_cached_field 'updated_at' || true)"
+  if [[ -z "${ts:-}" || ! "$ts" =~ ^[0-9]+$ ]]; then
+    printf '%s' 0
+    return 0
+  fi
+  printf '%s' "$ts"
+}
+
+strip_legacy_label_prefix() {
+  local v="${1:-}"
+
+  v="${v#S:}"
+  v="${v#W:}"
+
+  if [[ "$v" == "--" ]]; then
+    v="--%"
+  fi
+
+  printf '%s' "$v"
+}
+
+tmux_view_mode() {
+  if ! command -v tmux >/dev/null 2>&1; then
+    printf '%s' 'percent'
+    return 0
+  fi
+
+  local v
+  v="$(tmux show-option -gqv @codexbar_view 2>/dev/null || true)"
+  case "${v:-}" in
+    percent|reset)
+      printf '%s' "$v"
+      ;;
+    *)
+      printf '%s' 'percent'
+      ;;
+  esac
+}
+
+format_time_until_reset() {
+  local resets_at_epoch="$1" now="$2"
+
+  if [[ -z "${resets_at_epoch:-}" || ! "$resets_at_epoch" =~ ^[0-9]+$ ]]; then
+    printf '%s' '--'
+    return 0
+  fi
+
+  local delta_seconds
+  delta_seconds=$(( resets_at_epoch - now ))
+  if (( delta_seconds <= 0 )); then
+    printf '%s' '--'
+    return 0
+  fi
+
+  local total_minutes days hours minutes
+  total_minutes=$(( delta_seconds / 60 ))
+  if (( total_minutes <= 0 )); then
+    printf '%s' '--'
+    return 0
+  fi
+
+  days=$(( total_minutes / (60 * 24) ))
+  hours=$(( (total_minutes / 60) % 24 ))
+  minutes=$(( total_minutes % 60 ))
+
+  if (( days >= 1 )); then
+    printf '%sd%sh' "$days" "$hours"
+  elif (( hours >= 1 )); then
+    printf '%sh%sm' "$hours" "$minutes"
+  else
+    printf '%sm' "$minutes"
+  fi
+}
+
+print_value() {
+  local mode="$1" v view now resets_at
+
+  view="$(tmux_view_mode)"
+
+  maybe_set_tmux_color_from_cache "$mode"
+
+  if [[ "$view" == "reset" ]]; then
+    now="$(now_epoch)"
+    case "$mode" in
+      session)
+        resets_at="$(read_cached_field 'session_resets_at' 2>/dev/null || true)"
+        ;;
+      weekly)
+        resets_at="$(read_cached_field 'weekly_resets_at' 2>/dev/null || true)"
+        ;;
+      *)
+        usage
+        exit 2
+        ;;
+    esac
+
+    printf '%s\n' "$(format_time_until_reset "$resets_at" "$now")"
+    return 0
+  fi
+
+  case "$mode" in
+    session)
+      v="$(read_cached_field 'session_text' 2>/dev/null || true)"
+      if [[ -z "${v:-}" ]]; then
+        printf '%s\n' '--%'
+      else
+        printf '%s\n' "$(strip_legacy_label_prefix "$v")"
+      fi
+      ;;
+    weekly)
+      v="$(read_cached_field 'weekly_text' 2>/dev/null || true)"
+      if [[ -z "${v:-}" ]]; then
+        printf '%s\n' '--%'
+      else
+        printf '%s\n' "$(strip_legacy_label_prefix "$v")"
+      fi
+      ;;
+    *)
+      usage
+      exit 2
+      ;;
+  esac
+}
+
+clear_stale_lock_if_needed() {
+  [[ -d "$LOCKDIR" ]] || return 0
+
+  local started_at now age
+  started_at=0
+  if [[ -f "$LOCKDIR/started_at" ]]; then
+    started_at="$(cat "$LOCKDIR/started_at" 2>/dev/null || printf '0')"
+  fi
+
+  now="$(now_epoch)"
+  if [[ "$started_at" =~ ^[0-9]+$ ]]; then
+    age=$(( now - started_at ))
+  else
+    age=$LOCK_STALE_SECONDS
+  fi
+
+  if (( age > LOCK_STALE_SECONDS )); then
+    rm -rf "$LOCKDIR" 2>/dev/null || true
+  fi
+}
+
+try_acquire_lock() {
+  clear_stale_lock_if_needed
+
+  if mkdir "$LOCKDIR" 2>/dev/null; then
+    printf '%s\n' "$(now_epoch)" >"$LOCKDIR/started_at" 2>/dev/null || true
+    printf '%s\n' "$$" >"$LOCKDIR/pid" 2>/dev/null || true
+    return 0
+  fi
+
+  clear_stale_lock_if_needed
+  mkdir "$LOCKDIR" 2>/dev/null || return 1
+  printf '%s\n' "$(now_epoch)" >"$LOCKDIR/started_at" 2>/dev/null || true
+  printf '%s\n' "$$" >"$LOCKDIR/pid" 2>/dev/null || true
+  return 0
+}
+
+release_lock() {
+  rm -rf "$LOCKDIR" 2>/dev/null || true
+}
+
+spawn_background_refresh_locked() {
+  local script="$0"
+  if [[ "$script" != /* ]]; then
+    script="$(cd -- "$(dirname -- "$script")" && pwd)/$(basename -- "$script")"
+  fi
+
+  if [[ -n "${TMUX:-}" ]] && command -v tmux >/dev/null 2>&1; then
+    local lock_quoted script_quoted path_quoted
+    lock_quoted="$(printf '%q' "$LOCKDIR")"
+    script_quoted="$(printf '%q' "$script")"
+    path_quoted="$(printf '%q' "${PATH:-}")"
+    tmux run-shell -b "env PATH=${path_quoted} CODEXBAR_USAGE_LOCK_HELD=1 CODEXBAR_USAGE_LOCKDIR=${lock_quoted} ${script_quoted} --refresh >/dev/null 2>&1"
+  else
+    nohup env CODEXBAR_USAGE_LOCK_HELD=1 CODEXBAR_USAGE_LOCKDIR="$LOCKDIR" "$script" --refresh >/dev/null 2>&1 &
+  fi
+}
+
+ensure_codex_cli_in_path() {
+  command -v codex >/dev/null 2>&1 && return 0
+
+  local bin
+
+  local had_nullglob=0
+  if shopt -q nullglob; then
+    had_nullglob=1
+  fi
+  shopt -s nullglob
+  local candidate
+  for candidate in "$HOME/.nvm/versions/node/"*/bin/codex; do
+    if [[ -x "$candidate" ]]; then
+      bin="${candidate%/codex}"
+      PATH="$bin:$PATH"
+      export PATH
+      break
+    fi
+  done
+  if (( had_nullglob == 0 )); then
+    shopt -u nullglob
+  fi
+
+  command -v codex >/dev/null 2>&1 && return 0
+
+  if [[ -x "$HOME/.bun/bin/codex" ]]; then
+    PATH="$HOME/.bun/bin:$PATH"
+    export PATH
+    return 0
+  fi
+
+  if [[ -x "$HOME/.local/bin/codex" ]]; then
+    PATH="$HOME/.local/bin:$PATH"
+    export PATH
+    return 0
+  fi
+
+  return 0
+}
+
+refresh_cache() {
+  mkdir -p "$CACHE_DIR"
+
+  local lock_held="${CODEXBAR_USAGE_LOCK_HELD:-0}"
+  local env_lockdir="${CODEXBAR_USAGE_LOCKDIR:-$LOCKDIR}"
+
+  if [[ "$env_lockdir" != "$LOCKDIR" ]]; then
+    return 1
+  fi
+
+  if [[ "$lock_held" != "1" ]]; then
+    try_acquire_lock || return 0
+  fi
+
+  trap 'release_lock' EXIT
+
+  command -v codexbar >/dev/null 2>&1 || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+
+  ensure_codex_cli_in_path
+
+  local raw_json fetch_out
+  set +e
+  fetch_out="$(codexbar --provider codex --format json --json-only --web-timeout 2 2>&1)"
+  local fetch_status=$?
+  set -e
+
+  if (( fetch_status != 0 )); then
+    if [[ "$fetch_out" == *"Unknown option --json-only"* ]]; then
+      set +e
+      fetch_out="$(codexbar --provider codex --format json --web-timeout 2 2>&1)"
+      fetch_status=$?
+      set -e
+    fi
+  fi
+
+  if (( fetch_status != 0 )); then
+    return 1
+  fi
+
+  raw_json="$fetch_out"
+
+  local normalized session_raw weekly_raw
+  if ! normalized="$(printf '%s' "$raw_json" | jq -er 'if type=="array" then .[0] else . end' 2>/dev/null)"; then
+    return 1
+  fi
+
+  if ! session_raw="$(printf '%s' "$normalized" | jq -er '.usage.primary.usedPercent | tonumber' 2>/dev/null)"; then
+    return 1
+  fi
+  if ! weekly_raw="$(printf '%s' "$normalized" | jq -er '.usage.secondary.usedPercent | tonumber' 2>/dev/null)"; then
+    return 1
+  fi
+
+  local session_window_minutes session_resets_at
+  session_window_minutes="$(printf '%s' "$normalized" | jq -er '.usage.primary.windowMinutes // empty | tonumber' 2>/dev/null || true)"
+  local session_resets_at_iso
+  session_resets_at_iso="$(printf '%s' "$normalized" | jq -er -r '.usage.primary.resetsAt // empty | tostring' 2>/dev/null || true)"
+  session_resets_at=""
+  if [[ -n "${session_resets_at_iso:-}" ]]; then
+    session_resets_at="$(iso_utc_to_epoch "$session_resets_at_iso" 2>/dev/null || true)"
+  fi
+
+  local weekly_window_minutes weekly_resets_at
+  weekly_window_minutes="$(printf '%s' "$normalized" | jq -er '.usage.secondary.windowMinutes // empty | tonumber' 2>/dev/null || true)"
+  local weekly_resets_at_iso
+  weekly_resets_at_iso="$(printf '%s' "$normalized" | jq -er -r '.usage.secondary.resetsAt // empty | tostring' 2>/dev/null || true)"
+  weekly_resets_at=""
+  if [[ -n "${weekly_resets_at_iso:-}" ]]; then
+    weekly_resets_at="$(iso_utc_to_epoch "$weekly_resets_at_iso" 2>/dev/null || true)"
+  fi
+
+  local session_window_minutes_json session_resets_at_json weekly_window_minutes_json weekly_resets_at_json
+  session_window_minutes_json='null'
+  session_resets_at_json='null'
+  weekly_window_minutes_json='null'
+  weekly_resets_at_json='null'
+
+  if [[ "$session_window_minutes" =~ ^[0-9]+$ ]]; then
+    session_window_minutes_json="$session_window_minutes"
+  fi
+  if [[ "$session_resets_at" =~ ^[0-9]+$ ]]; then
+    session_resets_at_json="$session_resets_at"
+  fi
+  if [[ "$weekly_window_minutes" =~ ^[0-9]+$ ]]; then
+    weekly_window_minutes_json="$weekly_window_minutes"
+  fi
+  if [[ "$weekly_resets_at" =~ ^[0-9]+$ ]]; then
+    weekly_resets_at_json="$weekly_resets_at"
+  fi
+
+  local session_used weekly_used
+  session_used="$(clamp_0_100_int "$session_raw")" || return 1
+  weekly_used="$(clamp_0_100_int "$weekly_raw")" || return 1
+
+  local updated_at
+  updated_at="$(now_epoch)"
+
+  local weekly_pace
+  weekly_pace="$(weekly_pace_suffix "$weekly_used" "$weekly_window_minutes" "$weekly_resets_at" "$updated_at")"
+
+  local session_text weekly_text session_color weekly_color
+  session_text="${session_used}%"
+  weekly_text="${weekly_used}%${weekly_pace}"
+  session_color="$(color_for_used_percent "$session_used")"
+  weekly_color="$(color_for_used_percent "$weekly_used")"
+
+  local tmp
+  tmp="$(mktemp "${CACHE_DIR}/usage.json.tmp.XXXXXX")"
+
+  umask 077
+  cat >"$tmp" <<EOF
+{"updated_at":${updated_at},"session_used":${session_used},"weekly_used":${weekly_used},"session_window_minutes":${session_window_minutes_json},"session_resets_at":${session_resets_at_json},"weekly_window_minutes":${weekly_window_minutes_json},"weekly_resets_at":${weekly_resets_at_json},"session_windowMinutes":${session_window_minutes_json},"session_resetsAt":${session_resets_at_json},"weekly_windowMinutes":${weekly_window_minutes_json},"weekly_resetsAt":${weekly_resets_at_json},"session_text":"${session_text}","weekly_text":"${weekly_text}","session_color":"${session_color}","weekly_color":"${weekly_color}"}
+EOF
+
+  mv -f "$tmp" "$CACHE_FILE"
+
+  if command -v tmux >/dev/null 2>&1; then
+    tmux set-option -gq @codex_session_color "$session_color" >/dev/null 2>&1 || true
+    tmux set-option -gq @codex_weekly_color "$weekly_color" >/dev/null 2>&1 || true
+  fi
+}
+
+main() {
+  local mode="${1:-}"
+
+  case "$mode" in
+    --refresh)
+      refresh_cache || true
+      exit 0
+      ;;
+    session|weekly)
+      :
+      ;;
+    *)
+      usage
+      exit 2
+      ;;
+  esac
+
+  print_value "$mode"
+
+  local ts now age
+  ts="$(cache_updated_at)"
+  now="$(now_epoch)"
+  age=$(( now - ts ))
+
+  if [[ ! -f "$CACHE_FILE" ]] || (( age > STALE_AFTER_SECONDS )); then
+    mkdir -p "$CACHE_DIR"
+    if try_acquire_lock; then
+      spawn_background_refresh_locked
+    fi
+  fi
+}
+
+main "$@"

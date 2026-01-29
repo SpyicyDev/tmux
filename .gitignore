@@ -1,0 +1,3 @@
+# Local-only: tmux plugins are TPM-managed; ignore automation artifacts.
+/plugins/
+/.sisyphus/
