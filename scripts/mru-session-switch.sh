@@ -26,7 +26,7 @@ main() {
   local list
   list="$({
     tmux list-sessions -F $'#{session_last_attached}\t#{session_name}' 2>/dev/null \
-      | awk -F $'\t' -v cur="$current_session" '$2 != cur' \
+      | awk -F $'\t' -v cur="$current_session" '$2 != cur && $2 != "scratch"' \
       | sort -t $'\t' -k1,1nr \
       | cut -f2-
   } || true)"
@@ -52,6 +52,10 @@ main() {
   fi
 
   [[ -n "${target:-}" ]] || exit 0
+
+  if [[ "${target:-}" == "scratch" ]]; then
+    exit 0
+  fi
 
   if ! is_valid_session_name "$target"; then
     tmux display-message "Invalid session name (allowed: A-Z a-z 0-9 . _ -): $target"
