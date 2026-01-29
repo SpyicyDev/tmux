@@ -6,8 +6,97 @@ set -euo pipefail
 CACHE_DIR="${HOME}/.cache/codexbar-tmux"
 CACHE_FILE="${CACHE_DIR}/usage.json"
 LOCKDIR="${CACHE_FILE}.lock"
+BACKOFF_FILE="${CACHE_DIR}/refresh_backoff"
 
-STALE_AFTER_SECONDS=30
+tmux_opt_or_empty() {
+  local opt_name="${1:-}"
+
+  command -v tmux >/dev/null 2>&1 || { printf '%s' ""; return 0; }
+  [[ -n "${opt_name:-}" ]] || { printf '%s' ""; return 0; }
+
+  tmux show-option -gqv "$opt_name" 2>/dev/null || true
+}
+
+opt_or_env_or_default() {
+  local opt_name="${1:-}" env_name="${2:-}" default_value="${3:-}"
+
+  local v
+  v="$(tmux_opt_or_empty "$opt_name")"
+  if [[ -n "${v:-}" ]]; then
+    printf '%s' "$v"
+    return 0
+  fi
+
+  if [[ -n "${env_name:-}" ]]; then
+    v="${!env_name:-}"
+    if [[ -n "${v:-}" ]]; then
+      printf '%s' "$v"
+      return 0
+    fi
+  fi
+
+  printf '%s' "$default_value"
+}
+
+parse_int_with_default() {
+  local raw="${1:-}" default_value="${2:-0}"
+
+  if [[ "${raw:-}" =~ ^-?[0-9]+$ ]]; then
+    printf '%s' "$raw"
+  else
+    printf '%s' "$default_value"
+  fi
+
+  return 0
+}
+
+clamp_int_range() {
+  local raw="${1:-}" min="${2:-0}" max="${3:-0}"
+
+  local v
+  v="$(parse_int_with_default "$raw" "$min")"
+
+  if (( v < min )); then
+    v=$min
+  elif (( v > max )); then
+    v=$max
+  fi
+
+  printf '%s' "$v"
+  return 0
+}
+
+CODEXBAR_USAGE_DEBUG="$(parse_int_with_default "$(opt_or_env_or_default '@codexbar_debug' 'CODEXBAR_USAGE_DEBUG' '0')" 0)"
+USAGE_REFRESH_LOG_FILE="${CACHE_DIR}/usage-refresh.log"
+
+STALE_AFTER_SECONDS="$(parse_int_with_default "$(opt_or_env_or_default '@codexbar_stale_after_seconds' 'CODEXBAR_USAGE_STALE_AFTER_SECONDS' '300')" 300)"
+if (( STALE_AFTER_SECONDS < 30 )); then
+  STALE_AFTER_SECONDS=30
+fi
+
+WEB_TIMEOUT_SECONDS="$(clamp_int_range "$(opt_or_env_or_default '@codexbar_web_timeout' 'CODEXBAR_USAGE_WEB_TIMEOUT' '2')" 1 30)"
+
+log_debug() {
+  [[ -n "${CODEXBAR_USAGE_DEBUG:-}" && "${CODEXBAR_USAGE_DEBUG:-}" != "0" ]] || return 0
+
+  mkdir -p "$CACHE_DIR" 2>/dev/null || true
+
+  printf '%s pid=%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S%z')" "$$" "${1:-}" >>"$USAGE_REFRESH_LOG_FILE" 2>/dev/null || true
+}
+
+log_debug_trunc() {
+  local msg="${1:-}" max="${2:-200}"
+
+  msg="${msg//$'\n'/\\n}"
+  msg="${msg//$'\r'/}"
+
+  if (( ${#msg} > max )); then
+    msg="${msg:0:max}..."
+  fi
+
+  log_debug "$msg"
+}
+
 LOCK_STALE_SECONDS=120
 
 usage() {
@@ -16,6 +105,65 @@ usage() {
 
 now_epoch() {
   date +%s
+}
+
+# Backoff state to avoid spawning refresh every status tick when
+# remote refresh keeps failing (battery/network friendly).
+# Format: "fail_count next_allowed_epoch" (plain text, no jq required).
+read_refresh_backoff() {
+  local fail_count next_allowed
+
+  if [[ -f "$BACKOFF_FILE" ]]; then
+    read -r fail_count next_allowed <"$BACKOFF_FILE" 2>/dev/null || true
+  fi
+
+  if [[ -z "${fail_count:-}" || ! "$fail_count" =~ ^[0-9]+$ ]]; then
+    fail_count=0
+  fi
+  if [[ -z "${next_allowed:-}" || ! "$next_allowed" =~ ^[0-9]+$ ]]; then
+    next_allowed=0
+  fi
+
+  printf '%s %s' "$fail_count" "$next_allowed"
+}
+
+refresh_backoff_delay_seconds() {
+  local fail_count="${1:-0}"
+  if [[ -z "${fail_count:-}" || ! "$fail_count" =~ ^[0-9]+$ ]]; then
+    fail_count=0
+  fi
+
+  if (( fail_count <= 1 )); then
+    printf '%s' 60
+  elif (( fail_count == 2 )); then
+    printf '%s' 120
+  else
+    printf '%s' 300
+  fi
+}
+
+reset_refresh_backoff() {
+  rm -f "$BACKOFF_FILE" 2>/dev/null || true
+}
+
+record_refresh_backoff_failure() {
+  mkdir -p "$CACHE_DIR" 2>/dev/null || true
+
+  local fail_count next_allowed now delay
+  read -r fail_count next_allowed < <(read_refresh_backoff)
+
+  fail_count=$(( fail_count + 1 ))
+  delay="$(refresh_backoff_delay_seconds "$fail_count")"
+  now="$(now_epoch)"
+  next_allowed=$(( now + delay ))
+
+  umask 077
+  printf '%s %s\n' "$fail_count" "$next_allowed" >"$BACKOFF_FILE" 2>/dev/null || true
+}
+
+refresh_fail() {
+  record_refresh_backoff_failure
+  return 1
 }
 
 iso_utc_to_epoch() {
@@ -195,6 +343,58 @@ tmux_view_mode() {
   esac
 }
 
+effective_view_for_mode() {
+  local mode="${1:-}"
+
+  local baseline
+  baseline="$(tmux_view_mode)"
+
+  command -v tmux >/dev/null 2>&1 || { printf '%s' "$baseline"; return 0; }
+
+  local raw_until until now
+  raw_until="$(tmux_opt_or_empty '@codexbar_reset_preview_until')"
+  until="$(parse_int_with_default "$raw_until" 0)"
+  now="$(now_epoch)"
+
+  local preview_active=0
+  if (( until == -1 || until > now )); then
+    preview_active=1
+  fi
+
+  (( preview_active == 1 )) || { printf '%s' "$baseline"; return 0; }
+
+  local scope
+  scope="$(tmux_opt_or_empty '@codexbar_reset_view_scope')"
+  case "${scope:-}" in
+    session|weekly|both)
+      :
+      ;;
+    *)
+      scope='both'
+      ;;
+  esac
+
+  case "$scope" in
+    both)
+      printf '%s' 'reset'
+      ;;
+    session)
+      if [[ "$mode" == 'session' ]]; then
+        printf '%s' 'reset'
+      else
+        printf '%s' "$baseline"
+      fi
+      ;;
+    weekly)
+      if [[ "$mode" == 'weekly' ]]; then
+        printf '%s' 'reset'
+      else
+        printf '%s' "$baseline"
+      fi
+      ;;
+  esac
+}
+
 format_time_until_reset() {
   local resets_at_epoch="$1" now="$2"
 
@@ -233,7 +433,7 @@ format_time_until_reset() {
 print_value() {
   local mode="$1" v view now resets_at
 
-  view="$(tmux_view_mode)"
+  view="$(effective_view_for_mode "$mode")"
 
   maybe_set_tmux_color_from_cache "$mode"
 
@@ -327,15 +527,34 @@ spawn_background_refresh_locked() {
     script="$(cd -- "$(dirname -- "$script")" && pwd)/$(basename -- "$script")"
   fi
 
-  if [[ -n "${TMUX:-}" ]] && command -v tmux >/dev/null 2>&1; then
-    local lock_quoted script_quoted path_quoted
-    lock_quoted="$(printf '%q' "$LOCKDIR")"
-    script_quoted="$(printf '%q' "$script")"
-    path_quoted="$(printf '%q' "${PATH:-}")"
-    tmux run-shell -b "env PATH=${path_quoted} CODEXBAR_USAGE_LOCK_HELD=1 CODEXBAR_USAGE_LOCKDIR=${lock_quoted} ${script_quoted} --refresh >/dev/null 2>&1"
-  else
-    nohup env CODEXBAR_USAGE_LOCK_HELD=1 CODEXBAR_USAGE_LOCKDIR="$LOCKDIR" "$script" --refresh >/dev/null 2>&1 &
+  if ! try_acquire_lock; then
+    log_debug "spawn: skip (lock busy)"
+    return 0
   fi
+
+  if command -v tmux >/dev/null 2>&1; then
+    log_debug "spawn: tmux run-shell -b"
+    if tmux run-shell -b "CODEXBAR_USAGE_LOCK_HELD=1 CODEXBAR_USAGE_LOCKDIR=\"$LOCKDIR\" \"$script\" --refresh >/dev/null 2>&1" >/dev/null 2>&1; then
+      log_debug "spawn: tmux ok"
+      return 0
+    fi
+
+    log_debug "spawn: tmux failed"
+    release_lock
+    return 1
+  fi
+
+  log_debug "spawn: nohup"
+  nohup env CODEXBAR_USAGE_LOCK_HELD=1 CODEXBAR_USAGE_LOCKDIR="$LOCKDIR" "$script" --refresh >/dev/null 2>&1 &
+  local nohup_status=$?
+  if (( nohup_status == 0 )); then
+    log_debug "spawn: nohup ok"
+    return 0
+  fi
+
+  log_debug "spawn: nohup failed status=${nohup_status}"
+  release_lock
+  return 1
 }
 
 ensure_codex_cli_in_path() {
@@ -380,41 +599,50 @@ ensure_codex_cli_in_path() {
 
 refresh_cache() {
   mkdir -p "$CACHE_DIR"
+  log_debug "refresh: start"
 
-  local lock_held="${CODEXBAR_USAGE_LOCK_HELD:-0}"
-  local env_lockdir="${CODEXBAR_USAGE_LOCKDIR:-$LOCKDIR}"
-
-  if [[ "$env_lockdir" != "$LOCKDIR" ]]; then
-    return 1
+  if [[ "${CODEXBAR_USAGE_LOCK_HELD:-}" == "1" && "${CODEXBAR_USAGE_LOCKDIR:-}" == "$LOCKDIR" ]]; then
+    log_debug "refresh: lock inherited"
+  else
+    if ! try_acquire_lock; then
+      log_debug "refresh: lock busy"
+      return 0
+    fi
+    log_debug "refresh: lock acquired"
   fi
-
-  if [[ "$lock_held" != "1" ]]; then
-    try_acquire_lock || return 0
-  fi
-
   trap 'release_lock' EXIT
 
-  command -v codexbar >/dev/null 2>&1 || return 1
-  command -v jq >/dev/null 2>&1 || return 1
+  if ! command -v codexbar >/dev/null 2>&1; then
+    log_debug "refresh: missing tool codexbar"
+    refresh_fail
+    return 1
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    log_debug "refresh: missing tool jq"
+    refresh_fail
+    return 1
+  fi
 
   ensure_codex_cli_in_path
 
   local raw_json fetch_out
   set +e
-  fetch_out="$(codexbar --provider codex --format json --json-only --web-timeout 2 2>&1)"
+  fetch_out="$(codexbar --provider codex --format json --json-only --web-timeout "$WEB_TIMEOUT_SECONDS" 2>&1)"
   local fetch_status=$?
   set -e
 
   if (( fetch_status != 0 )); then
     if [[ "$fetch_out" == *"Unknown option --json-only"* ]]; then
       set +e
-      fetch_out="$(codexbar --provider codex --format json --web-timeout 2 2>&1)"
+      fetch_out="$(codexbar --provider codex --format json --web-timeout "$WEB_TIMEOUT_SECONDS" 2>&1)"
       fetch_status=$?
       set -e
     fi
   fi
 
   if (( fetch_status != 0 )); then
+    log_debug_trunc "refresh: codexbar nonzero status=${fetch_status} out=${fetch_out}" 300
+    refresh_fail
     return 1
   fi
 
@@ -422,13 +650,19 @@ refresh_cache() {
 
   local normalized session_raw weekly_raw
   if ! normalized="$(printf '%s' "$raw_json" | jq -er 'if type=="array" then .[0] else . end' 2>/dev/null)"; then
+    log_debug "refresh: jq parse failure (normalize)"
+    refresh_fail
     return 1
   fi
 
   if ! session_raw="$(printf '%s' "$normalized" | jq -er '.usage.primary.usedPercent | tonumber' 2>/dev/null)"; then
+    log_debug "refresh: jq parse failure (session usedPercent)"
+    refresh_fail
     return 1
   fi
   if ! weekly_raw="$(printf '%s' "$normalized" | jq -er '.usage.secondary.usedPercent | tonumber' 2>/dev/null)"; then
+    log_debug "refresh: jq parse failure (weekly usedPercent)"
+    refresh_fail
     return 1
   fi
 
@@ -470,8 +704,8 @@ refresh_cache() {
   fi
 
   local session_used weekly_used
-  session_used="$(clamp_0_100_int "$session_raw")" || return 1
-  weekly_used="$(clamp_0_100_int "$weekly_raw")" || return 1
+  session_used="$(clamp_0_100_int "$session_raw")" || { refresh_fail; return 1; }
+  weekly_used="$(clamp_0_100_int "$weekly_raw")" || { refresh_fail; return 1; }
 
   local updated_at
   updated_at="$(now_epoch)"
@@ -499,6 +733,10 @@ EOF
     tmux set-option -gq @codex_session_color "$session_color" >/dev/null 2>&1 || true
     tmux set-option -gq @codex_weekly_color "$weekly_color" >/dev/null 2>&1 || true
   fi
+
+  log_debug "refresh: success updated_at=${updated_at} session=${session_used}% weekly=${weekly_used}%"
+
+  reset_refresh_backoff
 }
 
 main() {
@@ -527,9 +765,14 @@ main() {
 
   if [[ ! -f "$CACHE_FILE" ]] || (( age > STALE_AFTER_SECONDS )); then
     mkdir -p "$CACHE_DIR"
-    if try_acquire_lock; then
-      spawn_background_refresh_locked
+
+    local fail_count next_allowed
+    read -r fail_count next_allowed < <(read_refresh_backoff)
+    if (( now < next_allowed )); then
+      return 0
     fi
+
+    spawn_background_refresh_locked || true
   fi
 }
 
