@@ -357,11 +357,6 @@ weekly_pace_suffix() {
   local expected_used delta_sign delta_abs
   expected_used="$(awk -v e="$elapsed" -v d="$duration" 'BEGIN { if (d <= 0) { print "0"; exit } printf "%.6f", (e / d) * 100 }')"
 
-  if awk -v x="$expected_used" 'BEGIN { exit (x >= 3.0) ? 0 : 1 }'; then
-    :
-  else
-    return 0
-  fi
 
   read -r delta_sign delta_abs < <(
     awk -v a="$actual_used_percent" -v e="$expected_used" 'BEGIN {
