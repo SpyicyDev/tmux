@@ -770,7 +770,7 @@ refresh_cache() {
   stderr_file="$(mktemp "${CACHE_DIR}/codexbar.stderr.XXXXXX")"
 
   set +e
-  fetch_out="$(codexbar --provider codex --format json --json-only --web-timeout "$WEB_TIMEOUT_SECONDS" 2>"$stderr_file")"
+  fetch_out="$(codexbar --provider claude --format json --json-only --web-timeout "$WEB_TIMEOUT_SECONDS" 2>"$stderr_file")"
   local fetch_status=$?
   set -e
   fetch_err="$(cat "$stderr_file" 2>/dev/null || true)"
@@ -779,7 +779,7 @@ refresh_cache() {
     if [[ "$fetch_out" == *"Unknown option --json-only"* || "$fetch_err" == *"Unknown option --json-only"* ]]; then
       : >"$stderr_file" 2>/dev/null || true
       set +e
-      fetch_out="$(codexbar --provider codex --format json --web-timeout "$WEB_TIMEOUT_SECONDS" 2>"$stderr_file")"
+      fetch_out="$(codexbar --provider claude --format json --web-timeout "$WEB_TIMEOUT_SECONDS" 2>"$stderr_file")"
       fetch_status=$?
       set -e
       fetch_err="$(cat "$stderr_file" 2>/dev/null || true)"
