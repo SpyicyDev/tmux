@@ -830,18 +830,211 @@ ensure_codex_cli_in_path() {
   return 0
 }
 
-read_claude_oauth_access_token() {
+CLAUDE_OAUTH_KEYCHAIN_SERVICE='Claude Code-credentials'
+CLAUDE_OAUTH_REFRESH_LOCKDIR="${CACHE_DIR}/oauth-refresh.lock"
+CLAUDE_OAUTH_TOKEN_URL='https://platform.claude.com/v1/oauth/token'
+CLAUDE_OAUTH_CLIENT_ID='9d1c250a-e61b-44d9-88ed-5944d1962f5e'
+
+read_claude_oauth_keychain_blob() {
   command -v security >/dev/null 2>&1 || return 1
+
+  local raw
+  raw="$(security find-generic-password -s "$CLAUDE_OAUTH_KEYCHAIN_SERVICE" -w 2>/dev/null || true)"
+  [[ -n "${raw:-}" ]] || return 1
+
+  printf '%s' "$raw"
+}
+
+read_claude_oauth_access_token() {
   command -v jq >/dev/null 2>&1 || return 1
 
   local raw token
-  raw="$(security find-generic-password -s 'Claude Code-credentials' -w 2>/dev/null || true)"
+  raw="$(read_claude_oauth_keychain_blob 2>/dev/null || true)"
   [[ -n "${raw:-}" ]] || return 1
 
   token="$(printf '%s' "$raw" | jq -er '.claudeAiOauth.accessToken' 2>/dev/null || true)"
   [[ -n "${token:-}" && "$token" == sk-ant-* ]] || return 1
 
   printf '%s' "$token"
+}
+
+read_claude_oauth_refresh_token() {
+  command -v jq >/dev/null 2>&1 || return 1
+
+  local raw token
+  raw="$(read_claude_oauth_keychain_blob 2>/dev/null || true)"
+  [[ -n "${raw:-}" ]] || return 1
+
+  token="$(printf '%s' "$raw" | jq -er '.claudeAiOauth.refreshToken' 2>/dev/null || true)"
+  [[ -n "${token:-}" && "$token" == sk-ant-ort01-* ]] || return 1
+
+  printf '%s' "$token"
+}
+
+# Atomically updates the Claude Code keychain entry with new access/refresh tokens
+# while preserving any other fields (subscriptionType, scopes, rateLimitTier, etc.).
+# Verifies the refresh token in the keychain still matches `expected_old_refresh`
+# right before writing - if Claude Code or another script already rotated it, we
+# bail out (prevents overwriting a newer rotation with our own stale tokens).
+write_claude_oauth_credentials() {
+  local new_access="$1" new_refresh="$2" new_expires_at_ms="$3" expected_old_refresh="$4"
+
+  command -v security >/dev/null 2>&1 || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+
+  [[ -n "$new_access" && "$new_access" == sk-ant-oat01-* ]] || return 1
+  [[ -n "$new_refresh" && "$new_refresh" == sk-ant-ort01-* ]] || return 1
+  [[ "$new_expires_at_ms" =~ ^[0-9]+$ ]] || return 1
+
+  local current_blob current_refresh updated_blob
+  current_blob="$(read_claude_oauth_keychain_blob 2>/dev/null || true)"
+  if [[ -z "${current_blob:-}" ]]; then
+    log_warn "oauth-refresh: keychain blob unavailable for write-verify"
+    return 1
+  fi
+
+  current_refresh="$(printf '%s' "$current_blob" | jq -er '.claudeAiOauth.refreshToken' 2>/dev/null || true)"
+  if [[ "$current_refresh" != "$expected_old_refresh" ]]; then
+    log_info "oauth-refresh: keychain rotated by another writer; skipping our write"
+    return 2
+  fi
+
+  updated_blob="$(
+    printf '%s' "$current_blob" | jq -c \
+      --arg at "$new_access" \
+      --arg rt "$new_refresh" \
+      --argjson exp "$new_expires_at_ms" \
+      '.claudeAiOauth.accessToken = $at
+       | .claudeAiOauth.refreshToken = $rt
+       | .claudeAiOauth.expiresAt = $exp' 2>/dev/null || true
+  )"
+  [[ -n "$updated_blob" ]] || { log_warn "oauth-refresh: jq merge failure"; return 1; }
+
+  if ! security add-generic-password -U \
+       -s "$CLAUDE_OAUTH_KEYCHAIN_SERVICE" \
+       -a "$USER" \
+       -w "$updated_blob" >/dev/null 2>&1; then
+    log_warn "oauth-refresh: security write failed"
+    return 1
+  fi
+
+  local verify_blob verify_refresh
+  verify_blob="$(read_claude_oauth_keychain_blob 2>/dev/null || true)"
+  verify_refresh="$(printf '%s' "$verify_blob" | jq -er '.claudeAiOauth.refreshToken' 2>/dev/null || true)"
+  if [[ "$verify_refresh" != "$new_refresh" ]]; then
+    log_warn "oauth-refresh: write verification failed (read-back mismatch)"
+    return 1
+  fi
+
+  return 0
+}
+
+try_acquire_refresh_lock() {
+  mkdir -p "$CACHE_DIR" 2>/dev/null || true
+
+  if [[ -d "$CLAUDE_OAUTH_REFRESH_LOCKDIR" ]]; then
+    local started
+    started="$(cat "$CLAUDE_OAUTH_REFRESH_LOCKDIR/started_at" 2>/dev/null || echo 0)"
+    local age=$(( $(now_epoch) - started ))
+    if (( age > 60 )); then
+      rm -rf "$CLAUDE_OAUTH_REFRESH_LOCKDIR" 2>/dev/null || true
+    fi
+  fi
+
+  mkdir "$CLAUDE_OAUTH_REFRESH_LOCKDIR" 2>/dev/null || return 1
+  printf '%s\n' "$(now_epoch)" >"$CLAUDE_OAUTH_REFRESH_LOCKDIR/started_at" 2>/dev/null || true
+  return 0
+}
+
+release_refresh_lock() {
+  rm -rf "$CLAUDE_OAUTH_REFRESH_LOCKDIR" 2>/dev/null || true
+}
+
+# Returns 0 on success (new tokens in keychain ready to use), non-zero on failure.
+# On success, the caller can re-read the access token from keychain and retry.
+try_oauth_token_refresh() {
+  command -v curl >/dev/null 2>&1 || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+
+  if ! try_acquire_refresh_lock; then
+    log_info "oauth-refresh: another instance is refreshing; skipping"
+    return 1
+  fi
+  trap 'release_refresh_lock' RETURN
+
+  local current_refresh
+  current_refresh="$(read_claude_oauth_refresh_token 2>/dev/null || true)"
+  if [[ -z "${current_refresh:-}" ]]; then
+    log_warn "oauth-refresh: no refresh token in keychain"
+    release_refresh_lock
+    return 1
+  fi
+
+  local body_file
+  body_file="$(umask 077 && mktemp "${CACHE_DIR}/oauth.body.XXXXXX")" || { release_refresh_lock; return 1; }
+  CODEXBAR_TMP_FILES+=("$body_file")
+
+  {
+    printf 'grant_type=refresh_token'
+    printf '&client_id=%s' "$CLAUDE_OAUTH_CLIENT_ID"
+    printf '&refresh_token='
+    printf '%s' "$current_refresh"
+  } >"$body_file" 2>/dev/null || { rm -f "$body_file"; release_refresh_lock; return 1; }
+
+  local response rc
+  response="$(curl -sS --max-time 10 \
+    -X POST "$CLAUDE_OAUTH_TOKEN_URL" \
+    -H 'Content-Type: application/x-www-form-urlencoded' \
+    -H 'User-Agent: claude-cli/1.0' \
+    --data-binary @"$body_file" 2>/dev/null)"
+  rc=$?
+  rm -f "$body_file" 2>/dev/null
+
+  if (( rc != 0 )); then
+    log_warn "oauth-refresh: curl failed rc=${rc}"
+    release_refresh_lock
+    return 1
+  fi
+
+  if printf '%s' "$response" | jq -e '.error' >/dev/null 2>&1; then
+    local err_type err_msg
+    err_type="$(printf '%s' "$response" | jq -r '.error.type // .error // "unknown"' 2>/dev/null)"
+    err_msg="$(printf '%s' "$response" | jq -r '.error.message // .error_description // ""' 2>/dev/null)"
+    log_warn "oauth-refresh: endpoint returned error type=${err_type} msg=${err_msg}"
+    release_refresh_lock
+    return 1
+  fi
+
+  local new_access new_refresh expires_in
+  new_access="$(printf '%s' "$response" | jq -er '.access_token' 2>/dev/null || true)"
+  new_refresh="$(printf '%s' "$response" | jq -er '.refresh_token' 2>/dev/null || true)"
+  expires_in="$(printf '%s' "$response" | jq -er '.expires_in' 2>/dev/null || echo 28800)"
+
+  if [[ -z "$new_access" || "$new_access" != sk-ant-oat01-* ]] \
+     || [[ -z "$new_refresh" || "$new_refresh" != sk-ant-ort01-* ]]; then
+    log_warn_trunc "oauth-refresh: malformed response: ${response}" 300
+    release_refresh_lock
+    return 1
+  fi
+
+  local new_expires_at_ms
+  new_expires_at_ms=$(( ($(now_epoch) + expires_in) * 1000 ))
+
+  local write_rc
+  write_claude_oauth_credentials "$new_access" "$new_refresh" "$new_expires_at_ms" "$current_refresh"
+  write_rc=$?
+  release_refresh_lock
+
+  if (( write_rc == 2 )); then
+    return 0
+  fi
+  if (( write_rc != 0 )); then
+    log_warn "oauth-refresh: keychain write failed; new tokens lost (will retry next failure)"
+    return 1
+  fi
+
+  log_info "oauth-refresh: success (token rotated, expires in ${expires_in}s)"
+  return 0
 }
 
 fetch_claude_oauth_usage_json() {
@@ -956,6 +1149,16 @@ fetch_via_codexbar_codex() {
   return 0
 }
 
+claude_oauth_response_is_auth_error() {
+  local response="$1"
+  [[ -n "$response" ]] || return 1
+  printf '%s' "$response" | jq -e '
+    (.error.type? == "authentication_error")
+    or (.error == "invalid_token")
+    or (.error == "invalid_grant")
+  ' >/dev/null 2>&1
+}
+
 fetch_via_claude_oauth() {
   reset_fetch_outputs
 
@@ -970,6 +1173,25 @@ fetch_via_claude_oauth() {
   if [[ -z "${raw:-}" ]]; then
     log_warn "refresh[claude]: empty oauth response"
     return 1
+  fi
+
+  if claude_oauth_response_is_auth_error "$raw"; then
+    log_info "refresh[claude]: auth error detected; attempting token refresh"
+    if try_oauth_token_refresh; then
+      token="$(read_claude_oauth_access_token 2>/dev/null || true)"
+      if [[ -n "${token:-}" ]]; then
+        raw="$(fetch_claude_oauth_usage_json "$token" 2>/dev/null || true)"
+      fi
+    fi
+
+    if [[ -z "${raw:-}" ]]; then
+      log_warn "refresh[claude]: empty oauth response after refresh attempt"
+      return 1
+    fi
+    if claude_oauth_response_is_auth_error "$raw"; then
+      log_warn "refresh[claude]: auth error persists after refresh attempt"
+      return 1
+    fi
   fi
 
   if ! printf '%s' "$raw" | jq -e '.five_hour and .seven_day' >/dev/null 2>&1; then
