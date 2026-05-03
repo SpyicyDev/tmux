@@ -96,26 +96,51 @@ esac
 
 BACKOFF_FILE="${CACHE_DIR}/refresh_backoff_${USAGE_PROVIDER}"
 
-log_debug() {
-  [[ -n "${CODEXBAR_USAGE_DEBUG:-}" && "${CODEXBAR_USAGE_DEBUG:-}" != "0" ]] || return 0
+USAGE_LOG_MAX_BYTES=$(( 256 * 1024 ))
 
-  mkdir -p "$CACHE_DIR" 2>/dev/null || true
+rotate_log_if_oversized() {
+  [[ -f "$USAGE_REFRESH_LOG_FILE" ]] || return 0
 
-  printf '%s pid=%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S%z')" "$$" "${1:-}" >>"$USAGE_REFRESH_LOG_FILE" 2>/dev/null || true
+  local size
+  size="$(stat -f %z "$USAGE_REFRESH_LOG_FILE" 2>/dev/null || stat -c %s "$USAGE_REFRESH_LOG_FILE" 2>/dev/null || echo 0)"
+  [[ "$size" =~ ^[0-9]+$ ]] || return 0
+  (( size > USAGE_LOG_MAX_BYTES )) || return 0
+
+  mv -f "$USAGE_REFRESH_LOG_FILE" "${USAGE_REFRESH_LOG_FILE}.1" 2>/dev/null || true
 }
 
-log_debug_trunc() {
-  local msg="${1:-}" max="${2:-200}"
+log_line() {
+  local level="${1:-INFO}" msg="${2:-}"
+  mkdir -p "$CACHE_DIR" 2>/dev/null || true
+  rotate_log_if_oversized
+  printf '%s pid=%s [%s] %s\n' \
+    "$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S%z')" \
+    "$$" "$level" "$msg" \
+    >>"$USAGE_REFRESH_LOG_FILE" 2>/dev/null || true
+}
 
+log_info()  { log_line INFO  "${1:-}"; }
+log_warn()  { log_line WARN  "${1:-}"; }
+log_error() { log_line ERROR "${1:-}"; }
+
+log_debug() {
+  [[ -n "${CODEXBAR_USAGE_DEBUG:-}" && "${CODEXBAR_USAGE_DEBUG:-}" != "0" ]] || return 0
+  log_line DEBUG "${1:-}"
+}
+
+truncate_msg() {
+  local msg="${1:-}" max="${2:-200}"
   msg="${msg//$'\n'/\\n}"
   msg="${msg//$'\r'/}"
-
   if (( ${#msg} > max )); then
     msg="${msg:0:max}..."
   fi
-
-  log_debug "$msg"
+  printf '%s' "$msg"
 }
+
+log_debug_trunc() { log_debug "$(truncate_msg "${1:-}" "${2:-200}")"; }
+log_warn_trunc()  { log_warn  "$(truncate_msg "${1:-}" "${2:-200}")"; }
+log_error_trunc() { log_error "$(truncate_msg "${1:-}" "${2:-200}")"; }
 
 debug_flash_codex_icons() {
   (( CODEXBAR_USAGE_DEBUG != 0 )) || return 0
@@ -680,7 +705,7 @@ clear_stale_lock_if_needed() {
   fi
 
   if [[ "${recorded_pid:-}" =~ ^[0-9]+$ ]] && (( recorded_pid > 0 )) && (( pid_alive == 0 )); then
-    log_debug "lock: clearing (recorded pid=${recorded_pid} not alive, age=${age})"
+    log_warn "lock: clearing (recorded pid=${recorded_pid} not alive, age=${age})"
     rm -rf "$LOCKDIR" 2>/dev/null || true
     return 0
   fi
@@ -690,14 +715,14 @@ clear_stale_lock_if_needed() {
       local cmdline
       cmdline="$(ps -p "$recorded_pid" -o command= 2>/dev/null || true)"
       if [[ "$cmdline" == *"codexbar-usage-status.sh"* ]]; then
-        log_debug "lock: killing wedged worker pid=${recorded_pid} age=${age}s"
+        log_warn "lock: killing wedged worker pid=${recorded_pid} age=${age}s"
         kill -TERM "$recorded_pid" 2>/dev/null || true
         sleep 1
         if kill -0 "$recorded_pid" 2>/dev/null; then
           kill -KILL "$recorded_pid" 2>/dev/null || true
         fi
       else
-        log_debug "lock: pid ${recorded_pid} reused by unrelated process; skipping kill"
+        log_warn "lock: pid ${recorded_pid} reused by unrelated process; skipping kill"
       fi
     fi
     rm -rf "$LOCKDIR" 2>/dev/null || true
@@ -861,7 +886,7 @@ fetch_via_codexbar_codex() {
   reset_fetch_outputs
 
   if ! command -v codexbar >/dev/null 2>&1; then
-    log_debug "refresh[codex]: missing tool codexbar"
+    log_warn "refresh[codex]: missing tool codexbar"
     return 1
   fi
 
@@ -891,22 +916,22 @@ fetch_via_codexbar_codex() {
   rm -f "$stderr_file" 2>/dev/null || true
 
   if (( fetch_status != 0 )); then
-    log_debug_trunc "refresh[codex]: codexbar nonzero status=${fetch_status} err=${fetch_err} out=${fetch_out}" 300
+    log_warn_trunc "refresh[codex]: codexbar nonzero status=${fetch_status} err=${fetch_err} out=${fetch_out}" 300
     return 1
   fi
 
   local normalized session_raw weekly_raw
   if ! normalized="$(printf '%s' "$fetch_out" | jq -ser '[.[] | (if type=="array" then .[0] else . end)] | map(select(.usage?)) | .[0]' 2>/dev/null)"; then
-    log_debug_trunc "refresh[codex]: jq parse failure (normalize) out=${fetch_out}" 300
+    log_warn_trunc "refresh[codex]: jq parse failure (normalize) out=${fetch_out}" 300
     return 1
   fi
 
   if ! session_raw="$(printf '%s' "$normalized" | jq -er '.usage.primary.usedPercent | tonumber' 2>/dev/null)"; then
-    log_debug "refresh[codex]: jq parse failure (session usedPercent)"
+    log_warn "refresh[codex]: jq parse failure (session usedPercent)"
     return 1
   fi
   if ! weekly_raw="$(printf '%s' "$normalized" | jq -er '.usage.secondary.usedPercent | tonumber' 2>/dev/null)"; then
-    log_debug "refresh[codex]: jq parse failure (weekly usedPercent)"
+    log_warn "refresh[codex]: jq parse failure (weekly usedPercent)"
     return 1
   fi
 
@@ -934,28 +959,28 @@ fetch_via_claude_oauth() {
   local token raw
   token="$(read_claude_oauth_access_token 2>/dev/null || true)"
   if [[ -z "${token:-}" ]]; then
-    log_debug "refresh[claude]: keychain token unavailable"
+    log_warn "refresh[claude]: keychain token unavailable"
     return 1
   fi
 
   raw="$(fetch_claude_oauth_usage_json "$token" 2>/dev/null || true)"
   if [[ -z "${raw:-}" ]]; then
-    log_debug "refresh[claude]: empty oauth response"
+    log_warn "refresh[claude]: empty oauth response"
     return 1
   fi
 
   if ! printf '%s' "$raw" | jq -e '.five_hour and .seven_day' >/dev/null 2>&1; then
-    log_debug_trunc "refresh[claude]: missing usage fields out=${raw}" 300
+    log_warn_trunc "refresh[claude]: missing usage fields out=${raw}" 300
     return 1
   fi
 
   local session_raw weekly_raw
   if ! session_raw="$(printf '%s' "$raw" | jq -er '.five_hour.utilization' 2>/dev/null)"; then
-    log_debug "refresh[claude]: missing five_hour.utilization"
+    log_warn "refresh[claude]: missing five_hour.utilization"
     return 1
   fi
   if ! weekly_raw="$(printf '%s' "$raw" | jq -er '.seven_day.utilization' 2>/dev/null)"; then
-    log_debug "refresh[claude]: missing seven_day.utilization"
+    log_warn "refresh[claude]: missing seven_day.utilization"
     return 1
   fi
 
@@ -1086,7 +1111,7 @@ EOF
     tmux refresh-client -S >/dev/null 2>&1 || true
   fi
 
-  log_debug "refresh: success updated_at=${updated_at} session=${session_used}% weekly=${weekly_used}%"
+  log_info "refresh: success updated_at=${updated_at} session=${session_used}% weekly=${weekly_used}% provider=${USAGE_PROVIDER}"
 
   reset_refresh_backoff
 }
