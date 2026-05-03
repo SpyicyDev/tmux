@@ -289,13 +289,14 @@ refresh_backoff_delay_seconds() {
     fail_count=0
   fi
 
-  if (( fail_count <= 1 )); then
-    printf '%s' 60
-  elif (( fail_count == 2 )); then
-    printf '%s' 120
-  else
-    printf '%s' 300
-  fi
+  case "$fail_count" in
+    0|1) printf '%s' 60 ;;
+    2)   printf '%s' 120 ;;
+    3)   printf '%s' 300 ;;
+    4)   printf '%s' 600 ;;
+    5)   printf '%s' 1800 ;;
+    *)   printf '%s' 3600 ;;
+  esac
 }
 
 reset_refresh_backoff() {
@@ -312,6 +313,8 @@ record_refresh_backoff_failure() {
   delay="$(refresh_backoff_delay_seconds "$fail_count")"
   now="$(now_epoch)"
   next_allowed=$(( now + delay ))
+
+  log_warn "backoff: fail_count=${fail_count} next_attempt_in=${delay}s provider=${USAGE_PROVIDER}"
 
   umask 077
   printf '%s %s\n' "$fail_count" "$next_allowed" >"$BACKOFF_FILE" 2>/dev/null || true
