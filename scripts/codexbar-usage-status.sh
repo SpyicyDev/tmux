@@ -6,7 +6,18 @@ set -euo pipefail
 CACHE_DIR="${HOME}/.cache/codexbar-tmux"
 CACHE_FILE="${CACHE_DIR}/usage.json"
 LOCKDIR="${CACHE_FILE}.lock"
-BACKOFF_FILE="${CACHE_DIR}/refresh_backoff"
+
+CODEXBAR_TMP_FILES=()
+
+cleanup_tmp_files() {
+  local f
+  for f in "${CODEXBAR_TMP_FILES[@]:-}"; do
+    [[ -n "${f:-}" ]] && rm -f "$f" 2>/dev/null || true
+  done
+  CODEXBAR_TMP_FILES=()
+}
+
+trap 'cleanup_tmp_files' EXIT INT TERM HUP
 
 tmux_opt_or_empty() {
   local opt_name="${1:-}"
@@ -76,6 +87,14 @@ if (( CODEXBAR_USAGE_DEBUG == 0 && STALE_AFTER_SECONDS < 30 )); then
 fi
 
 WEB_TIMEOUT_SECONDS="$(clamp_int_range "$(opt_or_env_or_default '@codexbar_web_timeout' 'CODEXBAR_USAGE_WEB_TIMEOUT' '2')" 1 30)"
+
+USAGE_PROVIDER="$(opt_or_env_or_default '@codexbar_provider' 'CODEXBAR_USAGE_PROVIDER' 'claude')"
+case "$USAGE_PROVIDER" in
+  claude|codex) ;;
+  *) USAGE_PROVIDER='claude' ;;
+esac
+
+BACKOFF_FILE="${CACHE_DIR}/refresh_backoff_${USAGE_PROVIDER}"
 
 log_debug() {
   [[ -n "${CODEXBAR_USAGE_DEBUG:-}" && "${CODEXBAR_USAGE_DEBUG:-}" != "0" ]] || return 0
@@ -159,6 +178,10 @@ schedule_debug_flash_tick() {
 
 start_debug_flash_loop_if_needed() {
   command -v tmux >/dev/null 2>&1 || return 0
+
+  if (( CODEXBAR_USAGE_DEBUG == 0 )); then
+    return 0
+  fi
 
   if ! debug_flash_loop_enabled; then
     tmux set-option -gu $debug_flash_loop_nonce_opt >/dev/null 2>&1 || true
@@ -278,6 +301,11 @@ iso_utc_to_epoch() {
   local iso="${1:-}"
   [[ -n "$iso" ]] || return 1
 
+  if [[ "$iso" =~ ^([0-9-]+T[0-9:]+)\.[0-9]+(.*)$ ]]; then
+    iso="${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
+  fi
+  iso="${iso/+00:00/Z}"
+
   local epoch
   epoch="$(date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$iso" +%s 2>/dev/null || true)"
   if [[ -z "${epoch:-}" ]]; then
@@ -369,50 +397,16 @@ weekly_pace_suffix() {
   printf ' (%s%s%%)' "$delta_sign" "$delta_abs"
 }
 
-read_cached_field() {
-  local field="$1"
-
-  [[ -f "$CACHE_FILE" ]] || return 1
-  command -v jq >/dev/null 2>&1 || return 1
-
-  jq -er ".$field" "$CACHE_FILE" 2>/dev/null
-}
-
-maybe_set_tmux_color_from_cache() {
-  local mode="$1" field opt color
-
-  [[ -f "$CACHE_FILE" ]] || return 0
-  command -v jq >/dev/null 2>&1 || return 0
-  command -v tmux >/dev/null 2>&1 || return 0
-
-  case "$mode" in
-    session)
-      field='session_color'
-      opt='@codex_session_color'
-      ;;
-    weekly)
-      field='weekly_color'
-      opt='@codex_weekly_color'
-      ;;
-    *)
-      return 0
-      ;;
-  esac
-
-  color="$(jq -er ".$field" "$CACHE_FILE" 2>/dev/null || true)"
-  [[ -n "${color:-}" ]] || return 0
-
-  tmux set-option -gq "$opt" "$color" >/dev/null 2>&1 || true
-}
-
 cache_updated_at() {
+  [[ -f "$CACHE_FILE" ]] || { printf '%s' 0; return 0; }
+
   local ts
-  ts="$(read_cached_field 'updated_at' || true)"
-  if [[ -z "${ts:-}" || ! "$ts" =~ ^[0-9]+$ ]]; then
+  ts="$(stat -f %m "$CACHE_FILE" 2>/dev/null || stat -c %Y "$CACHE_FILE" 2>/dev/null || true)"
+  if [[ "$ts" =~ ^[0-9]+$ ]]; then
+    printf '%s' "$ts"
+  else
     printf '%s' 0
-    return 0
   fi
-  printf '%s' "$ts"
 }
 
 strip_legacy_label_prefix() {
@@ -426,76 +420,6 @@ strip_legacy_label_prefix() {
   fi
 
   printf '%s' "$v"
-}
-
-tmux_view_mode() {
-  if ! command -v tmux >/dev/null 2>&1; then
-    printf '%s' 'percent'
-    return 0
-  fi
-
-  local v
-  v="$(tmux show-option -gqv @codexbar_view 2>/dev/null || true)"
-  case "${v:-}" in
-    percent|reset)
-      printf '%s' "$v"
-      ;;
-    *)
-      printf '%s' 'percent'
-      ;;
-  esac
-}
-
-effective_view_for_mode() {
-  local mode="${1:-}"
-
-  local baseline
-  baseline="$(tmux_view_mode)"
-
-  command -v tmux >/dev/null 2>&1 || { printf '%s' "$baseline"; return 0; }
-
-  local raw_until until now
-  raw_until="$(tmux_opt_or_empty '@codexbar_reset_preview_until')"
-  until="$(parse_int_with_default "$raw_until" 0)"
-  now="$(now_epoch)"
-
-  local preview_active=0
-  if (( until == -1 || until > now )); then
-    preview_active=1
-  fi
-
-  (( preview_active == 1 )) || { printf '%s' "$baseline"; return 0; }
-
-  local scope
-  scope="$(tmux_opt_or_empty '@codexbar_reset_view_scope')"
-  case "${scope:-}" in
-    session|weekly|both)
-      :
-      ;;
-    *)
-      scope='both'
-      ;;
-  esac
-
-  case "$scope" in
-    both)
-      printf '%s' 'reset'
-      ;;
-    session)
-      if [[ "$mode" == 'session' ]]; then
-        printf '%s' 'reset'
-      else
-        printf '%s' "$baseline"
-      fi
-      ;;
-    weekly)
-      if [[ "$mode" == 'weekly' ]]; then
-        printf '%s' 'reset'
-      else
-        printf '%s' "$baseline"
-      fi
-      ;;
-  esac
 }
 
 format_time_until_reset() {
@@ -533,64 +457,175 @@ format_time_until_reset() {
   fi
 }
 
-print_value() {
-  local mode="$1" v view now resets_at
+load_print_context() {
+  PRINT_VIEW_BASELINE='percent'
+  PRINT_PREVIEW_UNTIL='0'
+  PRINT_VIEW_SCOPE='both'
+  PRINT_DEBUG_COUNTER='0'
 
-  view="$(effective_view_for_mode "$mode")"
+  command -v tmux >/dev/null 2>&1 || return 0
 
-  maybe_set_tmux_color_from_cache "$mode"
+  local opts
+  opts="$(tmux show-options -g 2>/dev/null || true)"
+  [[ -n "${opts:-}" ]] || return 0
 
-  local debug_suffix=''
-  if (( CODEXBAR_USAGE_DEBUG != 0 )) && command -v tmux >/dev/null 2>&1; then
-    local c
-    c="$(tmux show-option -gqv "$debug_update_counter_opt" 2>/dev/null || true)"
-    if ! [[ "${c:-}" =~ ^[0-9]+$ ]]; then
-      c=0
-    fi
-    debug_suffix=" d${c}"
-  fi
-
-  if [[ "$view" == "reset" ]]; then
-    now="$(now_epoch)"
-    case "$mode" in
-      session)
-        resets_at="$(read_cached_field 'session_resets_at' 2>/dev/null || true)"
+  local line key val
+  while IFS= read -r line; do
+    case "$line" in
+      "@codexbar_view "*)
+        val="${line#@codexbar_view }"
+        val="${val#\"}"; val="${val%\"}"
+        case "$val" in
+          percent|reset) PRINT_VIEW_BASELINE="$val" ;;
+        esac
         ;;
-      weekly)
-        resets_at="$(read_cached_field 'weekly_resets_at' 2>/dev/null || true)"
+      "@codexbar_reset_preview_until "*)
+        val="${line#@codexbar_reset_preview_until }"
+        val="${val#\"}"; val="${val%\"}"
+        PRINT_PREVIEW_UNTIL="$val"
         ;;
-      *)
-        usage
-        exit 2
+      "@codexbar_reset_view_scope "*)
+        val="${line#@codexbar_reset_view_scope }"
+        val="${val#\"}"; val="${val%\"}"
+        case "$val" in
+          session|weekly|both) PRINT_VIEW_SCOPE="$val" ;;
+        esac
+        ;;
+      "$debug_update_counter_opt "*)
+        val="${line#$debug_update_counter_opt }"
+        val="${val#\"}"; val="${val%\"}"
+        PRINT_DEBUG_COUNTER="$val"
         ;;
     esac
+  done <<<"$opts"
+}
 
-    printf '%s\n' "$(format_time_until_reset "$resets_at" "$now")${debug_suffix}"
+effective_view_from_context() {
+  local mode="${1:-}"
+
+  local until now
+  until="$(parse_int_with_default "$PRINT_PREVIEW_UNTIL" 0)"
+  now="$(now_epoch)"
+
+  local preview_active=0
+  if (( until == -1 || until > now )); then
+    preview_active=1
+  fi
+
+  if (( preview_active == 0 )); then
+    printf '%s' "$PRINT_VIEW_BASELINE"
     return 0
   fi
 
-  case "$mode" in
+  case "$PRINT_VIEW_SCOPE" in
+    both)
+      printf '%s' 'reset'
+      ;;
     session)
-      v="$(read_cached_field 'session_text' 2>/dev/null || true)"
-      if [[ -z "${v:-}" ]]; then
-        printf '%s\n' "--%${debug_suffix}"
-      else
-        printf '%s\n' "$(strip_legacy_label_prefix "$v")${debug_suffix}"
-      fi
+      [[ "$mode" == 'session' ]] && printf '%s' 'reset' || printf '%s' "$PRINT_VIEW_BASELINE"
       ;;
     weekly)
-      v="$(read_cached_field 'weekly_text' 2>/dev/null || true)"
-      if [[ -z "${v:-}" ]]; then
-        printf '%s\n' "--%${debug_suffix}"
-      else
-        printf '%s\n' "$(strip_legacy_label_prefix "$v")${debug_suffix}"
-      fi
-      ;;
-    *)
-      usage
-      exit 2
+      [[ "$mode" == 'weekly' ]] && printf '%s' 'reset' || printf '%s' "$PRINT_VIEW_BASELINE"
       ;;
   esac
+}
+
+load_cache_fields() {
+  CACHE_SESSION_TEXT=''
+  CACHE_WEEKLY_TEXT=''
+  CACHE_SESSION_COLOR=''
+  CACHE_WEEKLY_COLOR=''
+  CACHE_SESSION_RESETS=''
+  CACHE_WEEKLY_RESETS=''
+
+  [[ -f "$CACHE_FILE" ]] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+
+  local parsed
+  parsed="$(jq -r '[.session_text//"", .weekly_text//"", .session_color//"", .weekly_color//"", .session_resets_at//"", .weekly_resets_at//""] | @tsv' "$CACHE_FILE" 2>/dev/null || true)"
+  [[ -n "$parsed" ]] || return 0
+  IFS=$'\t' read -r CACHE_SESSION_TEXT CACHE_WEEKLY_TEXT CACHE_SESSION_COLOR CACHE_WEEKLY_COLOR CACHE_SESSION_RESETS CACHE_WEEKLY_RESETS <<<"$parsed"
+}
+
+render_text_for_mode() {
+  local mode="$1" view="$2" debug_suffix="$3"
+  local out=''
+
+  if [[ "$view" == "reset" ]]; then
+    local now resets_at=''
+    now="$(now_epoch)"
+    case "$mode" in
+      session) resets_at="$CACHE_SESSION_RESETS" ;;
+      weekly)  resets_at="$CACHE_WEEKLY_RESETS" ;;
+    esac
+    out="$(format_time_until_reset "$resets_at" "$now")"
+  else
+    case "$mode" in
+      session) out="$CACHE_SESSION_TEXT" ;;
+      weekly)  out="$CACHE_WEEKLY_TEXT" ;;
+    esac
+    if [[ -z "$out" ]]; then
+      out="--%"
+    else
+      out="$(strip_legacy_label_prefix "$out")"
+    fi
+  fi
+
+  printf '%s%s' "$out" "$debug_suffix"
+}
+
+publish_to_tmux_opts() {
+  command -v tmux >/dev/null 2>&1 || return 0
+
+  load_print_context
+  load_cache_fields
+
+  local debug_suffix=''
+  if (( CODEXBAR_USAGE_DEBUG != 0 )); then
+    local c="$PRINT_DEBUG_COUNTER"
+    [[ "$c" =~ ^[0-9]+$ ]] || c=0
+    debug_suffix=" d${c}"
+  fi
+
+  local session_view weekly_view session_text weekly_text
+  session_view="$(effective_view_from_context session)"
+  weekly_view="$(effective_view_from_context weekly)"
+  session_text="$(render_text_for_mode session "$session_view" "$debug_suffix")"
+  weekly_text="$(render_text_for_mode weekly  "$weekly_view"  "$debug_suffix")"
+
+  tmux set-option -gq @codex_session_text "$session_text" >/dev/null 2>&1 || true
+  tmux set-option -gq @codex_weekly_text  "$weekly_text"  >/dev/null 2>&1 || true
+
+  if [[ -n "$CACHE_SESSION_COLOR" ]]; then
+    tmux set-option -gq @codex_session_color "$CACHE_SESSION_COLOR" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$CACHE_WEEKLY_COLOR" ]]; then
+    tmux set-option -gq @codex_weekly_color "$CACHE_WEEKLY_COLOR" >/dev/null 2>&1 || true
+  fi
+}
+
+print_value() {
+  local mode="$1" view debug_suffix=''
+
+  load_print_context
+  load_cache_fields
+
+  view="$(effective_view_from_context "$mode")"
+
+  if (( CODEXBAR_USAGE_DEBUG != 0 )); then
+    local c="$PRINT_DEBUG_COUNTER"
+    [[ "$c" =~ ^[0-9]+$ ]] || c=0
+    debug_suffix=" d${c}"
+  fi
+
+  if command -v tmux >/dev/null 2>&1; then
+    case "$mode" in
+      session) [[ -n "$CACHE_SESSION_COLOR" ]] && tmux set-option -gq @codex_session_color "$CACHE_SESSION_COLOR" >/dev/null 2>&1 || true ;;
+      weekly)  [[ -n "$CACHE_WEEKLY_COLOR" ]]  && tmux set-option -gq @codex_weekly_color  "$CACHE_WEEKLY_COLOR"  >/dev/null 2>&1 || true ;;
+    esac
+  fi
+
+  printf '%s\n' "$(render_text_for_mode "$mode" "$view" "$debug_suffix")"
 }
 
 lockdir_mtime_epoch() {
@@ -612,7 +647,15 @@ lockdir_mtime_epoch() {
 clear_stale_lock_if_needed() {
   [[ -d "$LOCKDIR" ]] || return 0
 
-  local started_at now age
+  local started_at now age recorded_pid pid_alive
+  recorded_pid="$(cat "$LOCKDIR/pid" 2>/dev/null || true)"
+  pid_alive=0
+  if [[ "${recorded_pid:-}" =~ ^[0-9]+$ ]] && (( recorded_pid > 0 )); then
+    if kill -0 "$recorded_pid" 2>/dev/null; then
+      pid_alive=1
+    fi
+  fi
+
   if [[ -f "$LOCKDIR/started_at" ]]; then
     started_at="$(cat "$LOCKDIR/started_at" 2>/dev/null || true)"
   else
@@ -636,24 +679,46 @@ clear_stale_lock_if_needed() {
     return 0
   fi
 
+  if [[ "${recorded_pid:-}" =~ ^[0-9]+$ ]] && (( recorded_pid > 0 )) && (( pid_alive == 0 )); then
+    log_debug "lock: clearing (recorded pid=${recorded_pid} not alive, age=${age})"
+    rm -rf "$LOCKDIR" 2>/dev/null || true
+    return 0
+  fi
+
   if (( age > LOCK_STALE_SECONDS )); then
+    if (( pid_alive == 1 )); then
+      local cmdline
+      cmdline="$(ps -p "$recorded_pid" -o command= 2>/dev/null || true)"
+      if [[ "$cmdline" == *"codexbar-usage-status.sh"* ]]; then
+        log_debug "lock: killing wedged worker pid=${recorded_pid} age=${age}s"
+        kill -TERM "$recorded_pid" 2>/dev/null || true
+        sleep 1
+        if kill -0 "$recorded_pid" 2>/dev/null; then
+          kill -KILL "$recorded_pid" 2>/dev/null || true
+        fi
+      else
+        log_debug "lock: pid ${recorded_pid} reused by unrelated process; skipping kill"
+      fi
+    fi
     rm -rf "$LOCKDIR" 2>/dev/null || true
   fi
 }
 
 try_acquire_lock() {
+  local pid_value="${1:-STARTING}"
+
   clear_stale_lock_if_needed
 
   if mkdir "$LOCKDIR" 2>/dev/null; then
     printf '%s\n' "$(now_epoch)" >"$LOCKDIR/started_at" 2>/dev/null || { rm -rf "$LOCKDIR" 2>/dev/null || true; return 1; }
-    printf '%s\n' "$$" >"$LOCKDIR/pid" 2>/dev/null || { rm -rf "$LOCKDIR" 2>/dev/null || true; return 1; }
+    printf '%s\n' "$pid_value" >"$LOCKDIR/pid" 2>/dev/null || { rm -rf "$LOCKDIR" 2>/dev/null || true; return 1; }
     return 0
   fi
 
   clear_stale_lock_if_needed
   mkdir "$LOCKDIR" 2>/dev/null || return 1
   printf '%s\n' "$(now_epoch)" >"$LOCKDIR/started_at" 2>/dev/null || { rm -rf "$LOCKDIR" 2>/dev/null || true; return 1; }
-  printf '%s\n' "$$" >"$LOCKDIR/pid" 2>/dev/null || { rm -rf "$LOCKDIR" 2>/dev/null || true; return 1; }
+  printf '%s\n' "$pid_value" >"$LOCKDIR/pid" 2>/dev/null || { rm -rf "$LOCKDIR" 2>/dev/null || true; return 1; }
   return 0
 }
 
@@ -737,37 +802,74 @@ ensure_codex_cli_in_path() {
   return 0
 }
 
-refresh_cache() {
-  mkdir -p "$CACHE_DIR"
-  log_debug "refresh: start"
+read_claude_oauth_access_token() {
+  command -v security >/dev/null 2>&1 || return 1
+  command -v jq >/dev/null 2>&1 || return 1
 
-  if [[ "${CODEXBAR_USAGE_LOCK_HELD:-}" == "1" && "${CODEXBAR_USAGE_LOCKDIR:-}" == "$LOCKDIR" ]]; then
-    log_debug "refresh: lock inherited"
-  else
-    if ! try_acquire_lock; then
-      log_debug "refresh: lock busy"
-      return 0
-    fi
-    log_debug "refresh: lock acquired"
-  fi
-  trap 'release_lock' EXIT
+  local raw token
+  raw="$(security find-generic-password -s 'Claude Code-credentials' -w 2>/dev/null || true)"
+  [[ -n "${raw:-}" ]] || return 1
+
+  token="$(printf '%s' "$raw" | jq -er '.claudeAiOauth.accessToken' 2>/dev/null || true)"
+  [[ -n "${token:-}" && "$token" == sk-ant-* ]] || return 1
+
+  printf '%s' "$token"
+}
+
+fetch_claude_oauth_usage_json() {
+  local token="$1"
+  command -v curl >/dev/null 2>&1 || return 1
+
+  local cfg result rc
+  cfg="$(umask 077 && mktemp "${CACHE_DIR}/curl.cfg.XXXXXX")" || return 1
+  CODEXBAR_TMP_FILES+=("$cfg")
+
+  {
+    printf 'silent\n'
+    printf 'show-error\n'
+    printf 'max-time = %s\n' "$WEB_TIMEOUT_SECONDS"
+    printf 'header = "Authorization: Bearer %s"\n' "$token"
+    printf 'header = "anthropic-beta: oauth-2025-04-20"\n'
+    printf 'header = "Content-Type: application/json"\n'
+    printf 'url = "https://api.anthropic.com/api/oauth/usage"\n'
+  } >"$cfg" 2>/dev/null || { rm -f "$cfg" 2>/dev/null; return 1; }
+
+  result="$(curl --config "$cfg" 2>/dev/null)"
+  rc=$?
+  rm -f "$cfg" 2>/dev/null
+  (( rc == 0 )) || return 1
+  printf '%s' "$result"
+}
+
+FETCH_SESSION_USED=''
+FETCH_WEEKLY_USED=''
+FETCH_SESSION_WINDOW_MINUTES=''
+FETCH_WEEKLY_WINDOW_MINUTES=''
+FETCH_SESSION_RESETS_AT=''
+FETCH_WEEKLY_RESETS_AT=''
+
+reset_fetch_outputs() {
+  FETCH_SESSION_USED=''
+  FETCH_WEEKLY_USED=''
+  FETCH_SESSION_WINDOW_MINUTES=''
+  FETCH_WEEKLY_WINDOW_MINUTES=''
+  FETCH_SESSION_RESETS_AT=''
+  FETCH_WEEKLY_RESETS_AT=''
+}
+
+fetch_via_codexbar_codex() {
+  reset_fetch_outputs
 
   if ! command -v codexbar >/dev/null 2>&1; then
-    log_debug "refresh: missing tool codexbar"
-    refresh_fail
-    return 1
-  fi
-  if ! command -v jq >/dev/null 2>&1; then
-    log_debug "refresh: missing tool jq"
-    refresh_fail
+    log_debug "refresh[codex]: missing tool codexbar"
     return 1
   fi
 
   ensure_codex_cli_in_path
 
-  local raw_json fetch_out fetch_err stderr_file
-
+  local fetch_out fetch_err fetch_status stderr_file
   stderr_file="$(mktemp "${CACHE_DIR}/codexbar.stderr.XXXXXX")"
+  CODEXBAR_TMP_FILES+=("$stderr_file")
 
   set +e
   fetch_out="$(codexbar --provider claude --format json --json-only --web-timeout "$WEB_TIMEOUT_SECONDS" 2>"$stderr_file")"
@@ -789,48 +891,133 @@ refresh_cache() {
   rm -f "$stderr_file" 2>/dev/null || true
 
   if (( fetch_status != 0 )); then
-    log_debug_trunc "refresh: codexbar nonzero status=${fetch_status} err=${fetch_err} out=${fetch_out}" 300
-    refresh_fail
+    log_debug_trunc "refresh[codex]: codexbar nonzero status=${fetch_status} err=${fetch_err} out=${fetch_out}" 300
     return 1
   fi
 
-  raw_json="$fetch_out"
-
   local normalized session_raw weekly_raw
-  if ! normalized="$(printf '%s' "$raw_json" | jq -ser '[.[] | (if type=="array" then .[0] else . end)] | map(select(.usage?)) | .[0]' 2>/dev/null)"; then
-    log_debug_trunc "refresh: jq parse failure (normalize) out=${raw_json}" 300
-    refresh_fail
+  if ! normalized="$(printf '%s' "$fetch_out" | jq -ser '[.[] | (if type=="array" then .[0] else . end)] | map(select(.usage?)) | .[0]' 2>/dev/null)"; then
+    log_debug_trunc "refresh[codex]: jq parse failure (normalize) out=${fetch_out}" 300
     return 1
   fi
 
   if ! session_raw="$(printf '%s' "$normalized" | jq -er '.usage.primary.usedPercent | tonumber' 2>/dev/null)"; then
-    log_debug "refresh: jq parse failure (session usedPercent)"
-    refresh_fail
+    log_debug "refresh[codex]: jq parse failure (session usedPercent)"
     return 1
   fi
   if ! weekly_raw="$(printf '%s' "$normalized" | jq -er '.usage.secondary.usedPercent | tonumber' 2>/dev/null)"; then
-    log_debug "refresh: jq parse failure (weekly usedPercent)"
+    log_debug "refresh[codex]: jq parse failure (weekly usedPercent)"
+    return 1
+  fi
+
+  FETCH_SESSION_USED="$session_raw"
+  FETCH_WEEKLY_USED="$weekly_raw"
+  FETCH_SESSION_WINDOW_MINUTES="$(printf '%s' "$normalized" | jq -er '.usage.primary.windowMinutes // empty | tonumber' 2>/dev/null || true)"
+  FETCH_WEEKLY_WINDOW_MINUTES="$(printf '%s' "$normalized" | jq -er '.usage.secondary.windowMinutes // empty | tonumber' 2>/dev/null || true)"
+
+  local iso
+  iso="$(printf '%s' "$normalized" | jq -er -r '.usage.primary.resetsAt // empty | tostring' 2>/dev/null || true)"
+  if [[ -n "${iso:-}" ]]; then
+    FETCH_SESSION_RESETS_AT="$(iso_utc_to_epoch "$iso" 2>/dev/null || true)"
+  fi
+  iso="$(printf '%s' "$normalized" | jq -er -r '.usage.secondary.resetsAt // empty | tostring' 2>/dev/null || true)"
+  if [[ -n "${iso:-}" ]]; then
+    FETCH_WEEKLY_RESETS_AT="$(iso_utc_to_epoch "$iso" 2>/dev/null || true)"
+  fi
+
+  return 0
+}
+
+fetch_via_claude_oauth() {
+  reset_fetch_outputs
+
+  local token raw
+  token="$(read_claude_oauth_access_token 2>/dev/null || true)"
+  if [[ -z "${token:-}" ]]; then
+    log_debug "refresh[claude]: keychain token unavailable"
+    return 1
+  fi
+
+  raw="$(fetch_claude_oauth_usage_json "$token" 2>/dev/null || true)"
+  if [[ -z "${raw:-}" ]]; then
+    log_debug "refresh[claude]: empty oauth response"
+    return 1
+  fi
+
+  if ! printf '%s' "$raw" | jq -e '.five_hour and .seven_day' >/dev/null 2>&1; then
+    log_debug_trunc "refresh[claude]: missing usage fields out=${raw}" 300
+    return 1
+  fi
+
+  local session_raw weekly_raw
+  if ! session_raw="$(printf '%s' "$raw" | jq -er '.five_hour.utilization' 2>/dev/null)"; then
+    log_debug "refresh[claude]: missing five_hour.utilization"
+    return 1
+  fi
+  if ! weekly_raw="$(printf '%s' "$raw" | jq -er '.seven_day.utilization' 2>/dev/null)"; then
+    log_debug "refresh[claude]: missing seven_day.utilization"
+    return 1
+  fi
+
+  FETCH_SESSION_USED="$session_raw"
+  FETCH_WEEKLY_USED="$weekly_raw"
+  FETCH_SESSION_WINDOW_MINUTES=300
+  FETCH_WEEKLY_WINDOW_MINUTES=10080
+
+  local iso
+  iso="$(printf '%s' "$raw" | jq -er -r '.five_hour.resets_at // empty | tostring' 2>/dev/null || true)"
+  if [[ -n "${iso:-}" ]]; then
+    FETCH_SESSION_RESETS_AT="$(iso_utc_to_epoch "$iso" 2>/dev/null || true)"
+  fi
+  iso="$(printf '%s' "$raw" | jq -er -r '.seven_day.resets_at // empty | tostring' 2>/dev/null || true)"
+  if [[ -n "${iso:-}" ]]; then
+    FETCH_WEEKLY_RESETS_AT="$(iso_utc_to_epoch "$iso" 2>/dev/null || true)"
+  fi
+
+  return 0
+}
+
+refresh_cache() {
+  mkdir -p "$CACHE_DIR"
+  log_debug "refresh: start provider=${USAGE_PROVIDER}"
+
+  if [[ "${CODEXBAR_USAGE_LOCK_HELD:-}" == "1" && "${CODEXBAR_USAGE_LOCKDIR:-}" == "$LOCKDIR" ]]; then
+    log_debug "refresh: lock inherited"
+    printf '%s\n' "$$" >"$LOCKDIR/pid" 2>/dev/null || true
+    printf '%s\n' "$(now_epoch)" >"$LOCKDIR/started_at" 2>/dev/null || true
+  else
+    if ! try_acquire_lock "$$"; then
+      log_debug "refresh: lock busy"
+      return 0
+    fi
+    log_debug "refresh: lock acquired"
+  fi
+  trap 'release_lock; cleanup_tmp_files' EXIT INT TERM HUP
+
+  if ! command -v jq >/dev/null 2>&1; then
+    log_debug "refresh: missing tool jq"
     refresh_fail
     return 1
   fi
 
-  local session_window_minutes session_resets_at
-  session_window_minutes="$(printf '%s' "$normalized" | jq -er '.usage.primary.windowMinutes // empty | tonumber' 2>/dev/null || true)"
-  local session_resets_at_iso
-  session_resets_at_iso="$(printf '%s' "$normalized" | jq -er -r '.usage.primary.resetsAt // empty | tostring' 2>/dev/null || true)"
-  session_resets_at=""
-  if [[ -n "${session_resets_at_iso:-}" ]]; then
-    session_resets_at="$(iso_utc_to_epoch "$session_resets_at_iso" 2>/dev/null || true)"
-  fi
+  case "$USAGE_PROVIDER" in
+    claude)
+      fetch_via_claude_oauth || { refresh_fail; return 1; }
+      ;;
+    codex)
+      fetch_via_codexbar_codex || { refresh_fail; return 1; }
+      ;;
+    *)
+      log_debug "refresh: unknown provider ${USAGE_PROVIDER}"
+      refresh_fail
+      return 1
+      ;;
+  esac
 
-  local weekly_window_minutes weekly_resets_at
-  weekly_window_minutes="$(printf '%s' "$normalized" | jq -er '.usage.secondary.windowMinutes // empty | tonumber' 2>/dev/null || true)"
-  local weekly_resets_at_iso
-  weekly_resets_at_iso="$(printf '%s' "$normalized" | jq -er -r '.usage.secondary.resetsAt // empty | tostring' 2>/dev/null || true)"
-  weekly_resets_at=""
-  if [[ -n "${weekly_resets_at_iso:-}" ]]; then
-    weekly_resets_at="$(iso_utc_to_epoch "$weekly_resets_at_iso" 2>/dev/null || true)"
-  fi
+  local session_window_minutes="$FETCH_SESSION_WINDOW_MINUTES"
+  local weekly_window_minutes="$FETCH_WEEKLY_WINDOW_MINUTES"
+  local session_resets_at="$FETCH_SESSION_RESETS_AT"
+  local weekly_resets_at="$FETCH_WEEKLY_RESETS_AT"
 
   local session_window_minutes_json session_resets_at_json weekly_window_minutes_json weekly_resets_at_json
   session_window_minutes_json='null'
@@ -852,8 +1039,8 @@ refresh_cache() {
   fi
 
   local session_used weekly_used
-  session_used="$(clamp_0_100_int "$session_raw")" || { refresh_fail; return 1; }
-  weekly_used="$(clamp_0_100_int "$weekly_raw")" || { refresh_fail; return 1; }
+  session_used="$(clamp_0_100_int "$FETCH_SESSION_USED")" || { refresh_fail; return 1; }
+  weekly_used="$(clamp_0_100_int "$FETCH_WEEKLY_USED")" || { refresh_fail; return 1; }
 
   local updated_at
   updated_at="$(now_epoch)"
@@ -910,6 +1097,41 @@ main() {
   case "$mode" in
     --refresh)
       refresh_cache || true
+      publish_to_tmux_opts || true
+      exit 0
+      ;;
+    --publish)
+      publish_to_tmux_opts || true
+      exit 0
+      ;;
+    --tick)
+      # Debounce: when both catppuccin modules render in the same status tick,
+      # only the first --tick does work; the second sees a fresh marker and bails.
+      local tick_marker="${CACHE_DIR}/last_tick"
+      local tick_marker_age=999
+      if [[ -f "$tick_marker" ]]; then
+        local marker_ts
+        marker_ts="$(stat -f %m "$tick_marker" 2>/dev/null || stat -c %Y "$tick_marker" 2>/dev/null || echo 0)"
+        tick_marker_age=$(( $(now_epoch) - marker_ts ))
+      fi
+      if (( tick_marker_age < 2 )); then
+        exit 0
+      fi
+      mkdir -p "$CACHE_DIR"
+      : >"$tick_marker" 2>/dev/null || true
+
+      publish_to_tmux_opts || true
+      local tick_ts tick_now tick_age
+      tick_ts="$(cache_updated_at)"
+      tick_now="$(now_epoch)"
+      tick_age=$(( tick_now - tick_ts ))
+      if [[ ! -f "$CACHE_FILE" ]] || (( tick_age >= STALE_AFTER_SECONDS )); then
+        local fc na
+        read -r fc na < <(read_refresh_backoff)
+        if (( tick_now >= na )); then
+          spawn_background_refresh_locked || true
+        fi
+      fi
       exit 0
       ;;
     --debug-flash-tick)

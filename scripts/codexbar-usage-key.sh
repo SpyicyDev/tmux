@@ -52,8 +52,10 @@ gen_nonce() {
 }
 
 main() {
-  local seconds
+  local seconds script_dir status_script
   seconds="$(parse_reset_seconds)"
+  script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
+  status_script="$script_dir/codexbar-usage-status.sh"
 
   if (( seconds == 0 )); then
     local current
@@ -65,6 +67,7 @@ main() {
       tmux set-option -gq "@codexbar_reset_preview_until" "-1" >/dev/null 2>&1 || true
     fi
 
+    bash "$status_script" --publish >/dev/null 2>&1 || true
     tmux refresh-client -S >/dev/null 2>&1 || true
     return 0
   fi
@@ -77,9 +80,10 @@ main() {
   tmux set-option -gq "@codexbar_reset_preview_until" "$until" >/dev/null 2>&1 || true
   tmux set-option -gq "@codexbar_reset_preview_nonce" "$nonce" >/dev/null 2>&1 || true
 
+  bash "$status_script" --publish >/dev/null 2>&1 || true
   tmux refresh-client -S >/dev/null 2>&1 || true
 
-  tmux run-shell -b "sleep $seconds; n=\$(tmux show-option -gqv @codexbar_reset_preview_nonce 2>/dev/null); [ \"\$n\" = \"$nonce\" ] && tmux refresh-client -S >/dev/null 2>&1" >/dev/null 2>&1 || true
+  tmux run-shell -b "sleep $seconds; n=\$(tmux show-option -gqv @codexbar_reset_preview_nonce 2>/dev/null); if [ \"\$n\" = \"$nonce\" ]; then bash \"$status_script\" --publish >/dev/null 2>&1 || true; tmux refresh-client -S >/dev/null 2>&1; fi; exit 0" >/dev/null 2>&1 || true
 
 }
 
