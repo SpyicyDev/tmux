@@ -866,7 +866,7 @@ read_claude_oauth_refresh_token() {
   [[ -n "${raw:-}" ]] || return 1
 
   token="$(printf '%s' "$raw" | jq -er '.claudeAiOauth.refreshToken' 2>/dev/null || true)"
-  [[ -n "${token:-}" && "$token" == sk-ant-ort01-* ]] || return 1
+  [[ -n "${token:-}" && "$token" == sk-ant-ort* ]] || return 1
 
   printf '%s' "$token"
 }
@@ -882,8 +882,8 @@ write_claude_oauth_credentials() {
   command -v security >/dev/null 2>&1 || return 1
   command -v jq >/dev/null 2>&1 || return 1
 
-  [[ -n "$new_access" && "$new_access" == sk-ant-oat01-* ]] || return 1
-  [[ -n "$new_refresh" && "$new_refresh" == sk-ant-ort01-* ]] || return 1
+  [[ -n "$new_access" && "$new_access" == sk-ant-oat* ]] || return 1
+  [[ -n "$new_refresh" && "$new_refresh" == sk-ant-ort* ]] || return 1
   [[ "$new_expires_at_ms" =~ ^[0-9]+$ ]] || return 1
 
   local current_blob current_refresh updated_blob
@@ -960,7 +960,6 @@ try_oauth_token_refresh() {
     log_info "oauth-refresh: another instance is refreshing; skipping"
     return 1
   fi
-  trap 'release_refresh_lock' RETURN
 
   local current_refresh
   current_refresh="$(read_claude_oauth_refresh_token 2>/dev/null || true)"
@@ -998,8 +997,16 @@ try_oauth_token_refresh() {
 
   if printf '%s' "$response" | jq -e '.error' >/dev/null 2>&1; then
     local err_type err_msg
-    err_type="$(printf '%s' "$response" | jq -r '.error.type // .error // "unknown"' 2>/dev/null)"
-    err_msg="$(printf '%s' "$response" | jq -r '.error.message // .error_description // ""' 2>/dev/null)"
+    err_type="$(printf '%s' "$response" | jq -r '
+      (try .error.type catch null) //
+      (if (.error | type) == "string" then .error else "unknown" end)
+    ' 2>/dev/null)"
+    err_msg="$(printf '%s' "$response" | jq -r '
+      (try .error.message catch null) //
+      .error_description //
+      ""
+    ' 2>/dev/null)"
+    err_msg="${err_msg//$'\n'/ }"
     log_warn "oauth-refresh: endpoint returned error type=${err_type} msg=${err_msg}"
     release_refresh_lock
     return 1
@@ -1010,8 +1017,8 @@ try_oauth_token_refresh() {
   new_refresh="$(printf '%s' "$response" | jq -er '.refresh_token' 2>/dev/null || true)"
   expires_in="$(printf '%s' "$response" | jq -er '.expires_in' 2>/dev/null || echo 28800)"
 
-  if [[ -z "$new_access" || "$new_access" != sk-ant-oat01-* ]] \
-     || [[ -z "$new_refresh" || "$new_refresh" != sk-ant-ort01-* ]]; then
+  if [[ -z "$new_access" || "$new_access" != sk-ant-oat* ]] \
+     || [[ -z "$new_refresh" || "$new_refresh" != sk-ant-ort* ]]; then
     log_warn_trunc "oauth-refresh: malformed response: ${response}" 300
     release_refresh_lock
     return 1
@@ -1153,9 +1160,8 @@ claude_oauth_response_is_auth_error() {
   local response="$1"
   [[ -n "$response" ]] || return 1
   printf '%s' "$response" | jq -e '
-    (.error.type? == "authentication_error")
-    or (.error == "invalid_token")
-    or (.error == "invalid_grant")
+    ((try .error.type catch null) == "authentication_error")
+    or ((.error | type) == "string" and (.error == "invalid_token" or .error == "invalid_grant"))
   ' >/dev/null 2>&1
 }
 
