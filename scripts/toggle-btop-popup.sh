@@ -11,14 +11,27 @@ if [ "$current_session" = "$popup_session" ]; then
   exit 0
 fi
 
-if tmux has-session -t "$popup_session" 2>/dev/null; then
-  popup_cmd="tmux attach-session -t $popup_session"
-else
-  popup_cmd="tmux new-session -s $popup_session btop"
+if ! tmux has-session -t "$popup_session" 2>/dev/null; then
+  tmux new-session -d -s "$popup_session" btop
 fi
+tmux set-option -t "$popup_session" status off
+popup_cmd="tmux attach-session -t $popup_session"
+
+popup_width="92%"
+popup_height_pct=90
+popup_height="${popup_height_pct}%"
+popup_top_offset_pct=6
+popup_bottom_pct=$(( popup_top_offset_pct + popup_height_pct ))
 
 if [ -n "$target_client" ]; then
-  tmux display-popup -t "$target_client" -E -w 85% -h 85% "$popup_cmd"
+  client_height=$(tmux display-message -p -t "$target_client" '#{client_height}')
 else
-  tmux display-popup -E -w 85% -h 85% "$popup_cmd"
+  client_height=$(tmux display-message -p '#{client_height}')
+fi
+popup_y=$(( client_height * popup_bottom_pct / 100 ))
+
+if [ -n "$target_client" ]; then
+  tmux display-popup -t "$target_client" -E -w "$popup_width" -h "$popup_height" -y "$popup_y" "$popup_cmd"
+else
+  tmux display-popup -E -w "$popup_width" -h "$popup_height" -y "$popup_y" "$popup_cmd"
 fi
